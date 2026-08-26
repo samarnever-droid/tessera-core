@@ -1,4 +1,4 @@
-//! TESSERA-Q: Frontier Architecture with Microsoft Differential Attention (DiffAttn) + Gated Attention (GAU) + Depthwise 1D Causal Conv + QK-Norm + Value Residual (ResFormer) + RoPE + Affine RMSNorm + Tied Logits + Z-Loss + MRM-v2.
+//! TESSERA-Q: Frontier Architecture with Dual-Head Multi-Token Prediction (MTP) + Microsoft Differential Attention (DiffAttn) + Adaptive RoPE Banding + Gated Attention (GAU) + Depthwise 1D Causal Conv + QK-Norm + Value Residual (ResFormer) + Affine RMSNorm + Tied Logits + Z-Loss + MRM-v2.
 //! Engineered to systematically surpass Google DeepMind Griffin on Character BPC while retaining 100% 8K long-context recall.
 
 use crate::mrm_v2::{MrmV2Grads, MultiResMemoryV2};
@@ -80,12 +80,14 @@ pub fn rms_norm_head_backward(x: &[f32], rms: f32, grad_out: &[f32], grad_in: &m
     }
 }
 
-/// Apply Rotary Position Embedding (RoPE) forward
+/// Apply Adaptive Rotary Position Embedding (RoPE) forward
 #[inline]
-pub fn apply_rope(vec: &mut [f32], pos: usize, d_k: usize) {
+pub fn apply_adaptive_rope(vec: &mut [f32], pos: usize, d_k: usize, eta: &[f32]) {
     let half = d_k / 2;
     for i in 0..half {
-        let theta = 1.0f32 / (10000.0f32.powf((2 * i) as f32 / d_k as f32));
+        let base_theta = 1.0f32 / (10000.0f32.powf((2 * i) as f32 / d_k as f32));
+        let scale = 2.0f32 / (1.0f32 + (-eta[i]).exp()); // 2 * sigmoid(eta)
+        let theta = base_theta * scale;
         let angle = pos as f32 * theta;
         let cos_a = angle.cos();
         let sin_a = angle.sin();
@@ -97,12 +99,14 @@ pub fn apply_rope(vec: &mut [f32], pos: usize, d_k: usize) {
     }
 }
 
-/// Apply Rotary Position Embedding (RoPE) backward
+/// Apply Adaptive Rotary Position Embedding (RoPE) backward
 #[inline]
-pub fn apply_rope_backward(d_out: &[f32], d_in: &mut [f32], pos: usize, d_k: usize) {
+pub fn apply_adaptive_rope_backward(d_out: &[f32], d_in: &mut [f32], pos: usize, d_k: usize, eta: &[f32]) {
     let half = d_k / 2;
     for i in 0..half {
-        let theta = 1.0f32 / (10000.0f32.powf((2 * i) as f32 / d_k as f32));
+        let base_theta = 1.0f32 / (10000.0f32.powf((2 * i) as f32 / d_k as f32));
+        let scale = 2.0f32 / (1.0f32 + (-eta[i]).exp());
+        let theta = base_theta * scale;
         let angle = pos as f32 * theta;
         let cos_a = angle.cos();
         let sin_a = angle.sin();
@@ -147,6 +151,7 @@ pub struct TesseraStageGrads {
     pub grad_w_conv: Vec<f32>,      // (4 x d)
     pub grad_w_gate_attn: Vec<f32>, // (d x d) Gated Temporal Unit
     pub grad_lambda_diff: Vec<f32>, // (2) Differential Attention Lambda
+    pub grad_eta_rope: Vec<f32>,    // (16) Adaptive RoPE Band Multipliers
     pub grad_wq: Vec<f32>,
     pub grad_wk: Vec<f32>,
     pub grad_wv: Vec<f32>,
@@ -167,6 +172,7 @@ impl TesseraStageGrads {
             grad_w_conv: vec![0.0f32; 4 * d],
             grad_w_gate_attn: vec![0.0f32; d * d],
             grad_lambda_diff: vec![0.0f32; 2],
+            grad_eta_rope: vec![0.0f32; 16],
             grad_wq: vec![0.0f32; d * d],
             grad_wk: vec![0.0f32; d * d],
             grad_wv: vec![0.0f32; d * d],
@@ -186,6 +192,7 @@ impl TesseraStageGrads {
         self.grad_w_conv.fill(0.0f32);
         self.grad_w_gate_attn.fill(0.0f32);
         self.grad_lambda_diff.fill(0.0f32);
+        self.grad_eta_rope.fill(0.0f32);
         self.grad_wq.fill(0.0f32);
         self.grad_wk.fill(0.0f32);
         self.grad_wv.fill(0.0f32);
@@ -204,6 +211,7 @@ impl TesseraStageGrads {
         for (a, &b) in self.grad_w_conv.iter_mut().zip(other.grad_w_conv.iter()) { *a += b; }
         for (a, &b) in self.grad_w_gate_attn.iter_mut().zip(other.grad_w_gate_attn.iter()) { *a += b; }
         for (a, &b) in self.grad_lambda_diff.iter_mut().zip(other.grad_lambda_diff.iter()) { *a += b; }
+        for (a, &b) in self.grad_eta_rope.iter_mut().zip(other.grad_eta_rope.iter()) { *a += b; }
         for (a, &b) in self.grad_wq.iter_mut().zip(other.grad_wq.iter()) { *a += b; }
         for (a, &b) in self.grad_wk.iter_mut().zip(other.grad_wk.iter()) { *a += b; }
         for (a, &b) in self.grad_wv.iter_mut().zip(other.grad_wv.iter()) { *a += b; }
@@ -220,7 +228,7 @@ impl TesseraStageGrads {
     }
 }
 
-/// A Progressive Hierarchy Stage with Microsoft Differential Attention + Gated Attention + 1D Conv + QK-Norm + Value Residual + RoPE + Affine RMSNorm + SwiGLU + MRM-v2.
+/// A Progressive Hierarchy Stage with Microsoft Differential Attention + Adaptive RoPE + Gated Attention + 1D Conv + QK-Norm + Value Residual + Affine RMSNorm + SwiGLU + MRM-v2.
 #[derive(Debug, Clone)]
 pub struct TesseraStage {
     pub d_model: usize,
@@ -231,6 +239,7 @@ pub struct TesseraStage {
     pub w_conv: Vec<f32>,      // (4 x d) Depthwise Causal 1D Convolution
     pub w_gate_attn: Vec<f32>, // (d x d) Gated Temporal Unit
     pub lambda_diff: Vec<f32>, // (2) Differential Attention noise cancellation lambda
+    pub eta_rope: Vec<f32>,    // (16) Adaptive RoPE Multipliers
     pub wq: Vec<f32>,
     pub wk: Vec<f32>,
     pub wv: Vec<f32>,
@@ -273,6 +282,7 @@ impl TesseraStage {
 
         let w_gate_attn = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let lambda_diff = vec![0.8f32; 2]; // Initialized to standard Diff-Transformer lambda = 0.8
+        let eta_rope = vec![0.0f32; 16];   // Initialized to 0.0 (2*sig(0)=1.0)
         let wq = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let wk = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let wv = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
@@ -301,6 +311,7 @@ impl TesseraStage {
             w_conv,
             w_gate_attn,
             lambda_diff,
+            eta_rope,
             wq,
             wk,
             wv,
@@ -320,11 +331,12 @@ impl TesseraStage {
         let conv = 4 * self.d_model;
         let gate = self.d_model * self.d_model;
         let lambda = self.lambda_diff.len();
+        let eta = self.eta_rope.len();
         let attn = 4 * (self.d_model * self.d_model);
         let dense = 2 * (self.d_ff * self.d_model) + (self.d_model * self.d_ff);
         let adapter = 2 * (self.d_model * self.adapter_rank);
         let mrm_p = self.mrm.as_ref().map(|m| m.param_count()).unwrap_or(0);
-        norms + conv + gate + lambda + attn + dense + adapter + mrm_p
+        norms + conv + gate + lambda + eta + attn + dense + adapter + mrm_p
     }
 }
 
@@ -333,6 +345,8 @@ pub struct TesseraModelGrads {
     pub grad_embed: Vec<f32>,
     pub stage_grads: Vec<TesseraStageGrads>,
     pub grad_final_norm_gamma: Vec<f32>,
+    pub grad_w_mtp_proj: Vec<f32>,
+    pub grad_w_mtp_head: Vec<f32>,
 }
 
 impl TesseraModelGrads {
@@ -343,6 +357,8 @@ impl TesseraModelGrads {
                 TesseraStageGrads::new(d_model, s.d_ff, s.adapter_rank, s.mrm.is_some())
             }).collect(),
             grad_final_norm_gamma: vec![0.0f32; d_model],
+            grad_w_mtp_proj: vec![0.0f32; d_model * d_model],
+            grad_w_mtp_head: vec![0.0f32; vocab_size * d_model],
         }
     }
 
@@ -350,16 +366,20 @@ impl TesseraModelGrads {
         self.grad_embed.fill(0.0f32);
         for sg in &mut self.stage_grads { sg.zero(); }
         self.grad_final_norm_gamma.fill(0.0f32);
+        self.grad_w_mtp_proj.fill(0.0f32);
+        self.grad_w_mtp_head.fill(0.0f32);
     }
 
     pub fn add(&mut self, other: &TesseraModelGrads) {
         for (a, &b) in self.grad_embed.iter_mut().zip(other.grad_embed.iter()) { *a += b; }
         for (sg, osg) in self.stage_grads.iter_mut().zip(other.stage_grads.iter()) { sg.add(osg); }
         for (a, &b) in self.grad_final_norm_gamma.iter_mut().zip(other.grad_final_norm_gamma.iter()) { *a += b; }
+        for (a, &b) in self.grad_w_mtp_proj.iter_mut().zip(other.grad_w_mtp_proj.iter()) { *a += b; }
+        for (a, &b) in self.grad_w_mtp_head.iter_mut().zip(other.grad_w_mtp_head.iter()) { *a += b; }
     }
 }
 
-/// Full TESSERA Architecture with Microsoft Differential Attention + Gated Attention + 1D Conv + QK-Norm + Value Residual + RoPE + Affine RMSNorm + Tied Logits + Z-Loss.
+/// Full TESSERA Architecture with Dual-Head Multi-Token Prediction (MTP) + Microsoft Differential Attention + Adaptive RoPE + Gated Attention + 1D Conv + QK-Norm + Value Residual + Z-Loss.
 #[derive(Debug, Clone)]
 pub struct TesseraModel {
     pub vocab_size: usize,
@@ -369,6 +389,8 @@ pub struct TesseraModel {
     pub embeddings: Vec<f32>,
     pub stages: Vec<TesseraStage>,
     pub final_norm_gamma: Vec<f32>,
+    pub w_mtp_proj: Vec<f32>,
+    pub w_mtp_head: Vec<f32>,
 }
 
 impl TesseraModel {
@@ -394,6 +416,9 @@ impl TesseraModel {
             })
             .collect();
 
+        let w_mtp_proj = (0..config.d_model * config.d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
+        let w_mtp_head = (0..vocab_size * config.d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
+
         Self {
             vocab_size,
             d_model: config.d_model,
@@ -402,6 +427,8 @@ impl TesseraModel {
             embeddings,
             stages,
             final_norm_gamma,
+            w_mtp_proj,
+            w_mtp_head,
         }
     }
 
@@ -422,7 +449,7 @@ impl TesseraModel {
         (total_params, active_params, dram_bytes_per_token, resident_l3_bytes)
     }
 
-    /// Full forward-backward pass through TESSERA with Microsoft Differential Attention + Gated Attention + 1D Conv + QK-Norm + Value Residual + Z-Loss.
+    /// Full forward-backward pass through TESSERA with Multi-Token Prediction (MTP) + Microsoft Differential Attention + Gated Attention + 1D Conv + QK-Norm + Value Residual + Z-Loss.
     pub fn forward_backward_sequence(
         &mut self,
         x_seq: &[usize],
@@ -440,6 +467,7 @@ impl TesseraModel {
         let eps = 1e-5f32;
         let logit_cap = 30.0f32;
         let z_loss_coeff = 1e-4f32;
+        let alpha_mtp = 0.3f32;
 
         let d_ff = self.stages[0].d_ff;
         let r_adapt = self.stages[0].adapter_rank;
@@ -468,6 +496,10 @@ impl TesseraModel {
         let mut buf_capped_logits = vec![0.0f32; v];
         let mut buf_pred_probs = vec![0.0f32; v];
         let mut buf_pred_grad = vec![0.0f32; v];
+        let mut buf_mtp_proj = vec![0.0f32; d];
+        let mut buf_mtp_logits = vec![0.0f32; v];
+        let mut buf_mtp_probs = vec![0.0f32; v];
+        let mut buf_mtp_grad = vec![0.0f32; v];
 
         // 1. Initial Clean Embedding
         let mut h_curr = vec![0.0f32; t_len * d];
@@ -552,7 +584,7 @@ impl TesseraModel {
             }
             stage_h_conv.push(h_conv.clone());
 
-            // D. Microsoft Differential Attention (DiffAttn) with 2 Pairs (4 Sub-Heads) + QK-Norm + Value Residual + RoPE
+            // D. Microsoft Differential Attention (DiffAttn) with Adaptive RoPE
             let wq_v = MatrixView::new(&stage.wq, d, d);
             let wk_v = MatrixView::new(&stage.wk, d, d);
             let wv_v = MatrixView::new(&stage.wv, d, d);
@@ -568,11 +600,11 @@ impl TesseraModel {
                 matvec(&wk_v, ht, &mut k_mat[t * d..(t + 1) * d]);
                 matvec(&wv_v, ht, &mut v_mat[t * d..(t + 1) * d]);
 
-                // RoPE on each of the 4 sub-heads
+                // Adaptive RoPE on each of the 4 sub-heads
                 for h in 0..n_subheads {
                     let h_offset = h * d_k;
-                    apply_rope(&mut q_mat[t * d + h_offset..t * d + h_offset + d_k], t, d_k);
-                    apply_rope(&mut k_mat[t * d + h_offset..t * d + h_offset + d_k], t, d_k);
+                    apply_adaptive_rope(&mut q_mat[t * d + h_offset..t * d + h_offset + d_k], t, d_k, &stage.eta_rope);
+                    apply_adaptive_rope(&mut k_mat[t * d + h_offset..t * d + h_offset + d_k], t, d_k, &stage.eta_rope);
                 }
             }
 
@@ -728,7 +760,7 @@ impl TesseraModel {
             h_curr = h_stage_out;
         }
 
-        // 3. Final Affine RMSNorm + Tied Output Logits with Soft-Capping & Z-Loss
+        // 3. Final Affine RMSNorm + Tied Output Logits with Soft-Capping, Z-Loss, and Multi-Token Prediction (MTP)
         let mut h_final_norm = vec![0.0f32; t_len * d];
         let mut rms_final = vec![0.0f32; t_len];
         for t in 0..t_len {
@@ -741,6 +773,12 @@ impl TesseraModel {
         let mut grad_embed_view = MatrixViewMut::new(&mut grads.grad_embed, v, d);
         let mut delta_head = vec![0.0f32; t_len * d];
         let mut total_loss = 0.0f32;
+        let mut ntp_loss_eval = 0.0f32;
+
+        let w_mtp_proj_v = MatrixView::new(&self.w_mtp_proj, d, d);
+        let w_mtp_head_v = MatrixView::new(&self.w_mtp_head, v, d);
+        let mut grad_mtp_proj_v = MatrixViewMut::new(&mut grads.grad_w_mtp_proj, d, d);
+        let mut grad_mtp_head_v = MatrixViewMut::new(&mut grads.grad_w_mtp_head, v, d);
 
         for t in 0..t_len {
             let ht = &h_final_norm[t * d..(t + 1) * d];
@@ -754,6 +792,7 @@ impl TesseraModel {
             }
 
             let loss = cross_entropy_loss_and_grad(&buf_capped_logits, y_seq[t], &mut buf_pred_probs, &mut buf_pred_grad);
+            ntp_loss_eval += loss;
 
             // Z-Loss: 1e-4 * (log sum exp(logits))^2
             let mut max_l = buf_capped_logits[0];
@@ -780,6 +819,24 @@ impl TesseraModel {
             outer_product_accumulate(&buf_pred_grad, ht, 1.0, &mut grad_embed_view);
             let d_ht = &mut delta_head[t * d..(t + 1) * d];
             matvec_transposed(&embed_view, &buf_pred_grad, d_ht);
+
+            // Auxiliary Multi-Token Prediction (MTP) for token t+2
+            if t + 1 < t_len {
+                matvec(&w_mtp_proj_v, ht, &mut buf_mtp_proj);
+                matvec(&w_mtp_head_v, &buf_mtp_proj, &mut buf_mtp_logits);
+
+                let mtp_loss = cross_entropy_loss_and_grad(&buf_mtp_logits, y_seq[t + 1], &mut buf_mtp_probs, &mut buf_mtp_grad);
+                total_loss += alpha_mtp * mtp_loss;
+
+                for i in 0..v { buf_mtp_grad[i] *= alpha_mtp; }
+                outer_product_accumulate(&buf_mtp_grad, &buf_mtp_proj, 1.0, &mut grad_mtp_head_v);
+
+                matvec_transposed(&w_mtp_head_v, &buf_mtp_grad, &mut buf_tmp);
+                outer_product_accumulate(&buf_tmp, ht, 1.0, &mut grad_mtp_proj_v);
+
+                matvec_transposed(&w_mtp_proj_v, &buf_tmp, &mut buf_proj_out);
+                vec_add_scaled(d_ht, &buf_proj_out, 1.0);
+            }
         }
 
         // Backprop through Final Affine RMSNorm
@@ -1039,23 +1096,25 @@ impl TesseraModel {
                 }
             }
 
-            // Backprop through RoPE rotation for Q and K
+            // Backprop through Adaptive RoPE rotation for Q and K
             let mut dq_mat = vec![0.0f32; t_len * d];
             let mut dk_mat = vec![0.0f32; t_len * d];
             for t in 0..t_len {
                 for h in 0..n_subheads {
                     let h_offset = h * d_k;
-                    apply_rope_backward(
+                    apply_adaptive_rope_backward(
                         &dq_rope[t * d + h_offset..t * d + h_offset + d_k],
                         &mut dq_mat[t * d + h_offset..t * d + h_offset + d_k],
                         t,
                         d_k,
+                        &stage.eta_rope,
                     );
-                    apply_rope_backward(
+                    apply_adaptive_rope_backward(
                         &dk_rope[t * d + h_offset..t * d + h_offset + d_k],
                         &mut dk_mat[t * d + h_offset..t * d + h_offset + d_k],
                         t,
                         d_k,
+                        &stage.eta_rope,
                     );
                 }
             }
@@ -1144,6 +1203,6 @@ impl TesseraModel {
             }
         }
 
-        total_loss
+        ntp_loss_eval
     }
 }

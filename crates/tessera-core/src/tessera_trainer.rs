@@ -1,5 +1,5 @@
-//! Multithreaded Batch Trainer for TESSERA with Warmup-Stable-Decay (WSD) & AVX-Accelerated AdamW Optimization.
-//! Implements 2024–2026 WSD dynamics (MiniMax/DeepSeek) for maximum parameter learning velocity and sharp cooldown descent.
+//! Multithreaded Batch Trainer for TESSERA with Dual-Head Multi-Token Prediction (MTP), Adaptive RoPE, Warmup-Stable-Decay (WSD), and AVX-Accelerated AdamW Optimization.
+//! Implements 2024–2026 DeepSeek-V3 MTP dynamics & WSD scheduling for peak validation convergence.
 
 use crate::tessera_model::{TesseraModel, TesseraModelGrads};
 use rand::rngs::StdRng;
@@ -14,6 +14,7 @@ pub struct StageMoments {
     pub m_conv: Vec<f32>, pub v_conv: Vec<f32>,
     pub m_gate_attn: Vec<f32>, pub v_gate_attn: Vec<f32>,
     pub m_lambda: Vec<f32>, pub v_lambda: Vec<f32>,
+    pub m_eta: Vec<f32>, pub v_eta: Vec<f32>,
     pub m_wq: Vec<f32>, pub v_wq: Vec<f32>,
     pub m_wk: Vec<f32>, pub v_wk: Vec<f32>,
     pub m_wv: Vec<f32>, pub v_wv: Vec<f32>,
@@ -33,6 +34,7 @@ impl StageMoments {
             m_conv: vec![0.0f32; 4 * d], v_conv: vec![0.0f32; 4 * d],
             m_gate_attn: vec![0.0f32; d * d], v_gate_attn: vec![0.0f32; d * d],
             m_lambda: vec![0.0f32; 2], v_lambda: vec![0.0f32; 2],
+            m_eta: vec![0.0f32; 16], v_eta: vec![0.0f32; 16],
             m_wq: vec![0.0f32; d * d], v_wq: vec![0.0f32; d * d],
             m_wk: vec![0.0f32; d * d], v_wk: vec![0.0f32; d * d],
             m_wv: vec![0.0f32; d * d], v_wv: vec![0.0f32; d * d],
@@ -57,6 +59,8 @@ pub struct TesseraAdamW {
     pub step: usize,
     pub m_embed: Vec<f32>, pub v_embed: Vec<f32>,
     pub m_final_norm: Vec<f32>, pub v_final_norm: Vec<f32>,
+    pub m_mtp_proj: Vec<f32>, pub v_mtp_proj: Vec<f32>,
+    pub m_mtp_head: Vec<f32>, pub v_mtp_head: Vec<f32>,
     pub stage_moments: Vec<StageMoments>,
 }
 
@@ -78,6 +82,10 @@ impl TesseraAdamW {
             v_embed: vec![0.0f32; model.embeddings.len()],
             m_final_norm: vec![0.0f32; model.final_norm_gamma.len()],
             v_final_norm: vec![0.0f32; model.final_norm_gamma.len()],
+            m_mtp_proj: vec![0.0f32; model.w_mtp_proj.len()],
+            v_mtp_proj: vec![0.0f32; model.w_mtp_proj.len()],
+            m_mtp_head: vec![0.0f32; model.w_mtp_head.len()],
+            v_mtp_head: vec![0.0f32; model.w_mtp_head.len()],
             stage_moments,
         }
     }
@@ -86,11 +94,14 @@ impl TesseraAdamW {
         let mut sum_sq = 0.0f32;
         for &g in &grads.grad_embed { sum_sq += g * g; }
         for &g in &grads.grad_final_norm_gamma { sum_sq += g * g; }
+        for &g in &grads.grad_w_mtp_proj { sum_sq += g * g; }
+        for &g in &grads.grad_w_mtp_head { sum_sq += g * g; }
         for sg in &grads.stage_grads {
             for &g in &sg.grad_norm1_gamma { sum_sq += g * g; }
             for &g in &sg.grad_w_conv { sum_sq += g * g; }
             for &g in &sg.grad_w_gate_attn { sum_sq += g * g; }
             for &g in &sg.grad_lambda_diff { sum_sq += g * g; }
+            for &g in &sg.grad_eta_rope { sum_sq += g * g; }
             for &g in &sg.grad_wq { sum_sq += g * g; }
             for &g in &sg.grad_wk { sum_sq += g * g; }
             for &g in &sg.grad_wv { sum_sq += g * g; }
@@ -142,12 +153,15 @@ impl TesseraAdamW {
 
         update_p(&mut model.embeddings, &grads.grad_embed, &mut self.m_embed, &mut self.v_embed);
         update_p(&mut model.final_norm_gamma, &grads.grad_final_norm_gamma, &mut self.m_final_norm, &mut self.v_final_norm);
+        update_p(&mut model.w_mtp_proj, &grads.grad_w_mtp_proj, &mut self.m_mtp_proj, &mut self.v_mtp_proj);
+        update_p(&mut model.w_mtp_head, &grads.grad_w_mtp_head, &mut self.m_mtp_head, &mut self.v_mtp_head);
 
         for ((stage, s_grads), sm) in model.stages.iter_mut().zip(grads.stage_grads.iter_mut()).zip(self.stage_moments.iter_mut()) {
             update_p(&mut stage.norm1_gamma, &s_grads.grad_norm1_gamma, &mut sm.m_n1, &mut sm.v_n1);
             update_p(&mut stage.w_conv, &s_grads.grad_w_conv, &mut sm.m_conv, &mut sm.v_conv);
             update_p(&mut stage.w_gate_attn, &s_grads.grad_w_gate_attn, &mut sm.m_gate_attn, &mut sm.v_gate_attn);
             update_p(&mut stage.lambda_diff, &s_grads.grad_lambda_diff, &mut sm.m_lambda, &mut sm.v_lambda);
+            update_p(&mut stage.eta_rope, &s_grads.grad_eta_rope, &mut sm.m_eta, &mut sm.v_eta);
             update_p(&mut stage.wq, &s_grads.grad_wq, &mut sm.m_wq, &mut sm.v_wq);
             update_p(&mut stage.wk, &s_grads.grad_wk, &mut sm.m_wk, &mut sm.v_wk);
             update_p(&mut stage.wv, &s_grads.grad_wv, &mut sm.m_wv, &mut sm.v_wv);
@@ -197,7 +211,7 @@ pub fn evaluate_tessera_bpc(
     (mean_loss, bpc)
 }
 
-/// Multithreaded Batch Training for TESSERA with Warmup-Stable-Decay (WSD).
+/// Multithreaded Batch Training for TESSERA with Warmup-Stable-Decay (WSD) & Multi-Token Prediction (MTP).
 pub fn train_tessera(
     model: &mut TesseraModel,
     train_data: &[u8],
@@ -272,11 +286,14 @@ pub fn train_tessera(
 
         axiom_core::tensor::vec_scale(&mut total_grads.grad_embed, scale);
         axiom_core::tensor::vec_scale(&mut total_grads.grad_final_norm_gamma, scale);
+        axiom_core::tensor::vec_scale(&mut total_grads.grad_w_mtp_proj, scale);
+        axiom_core::tensor::vec_scale(&mut total_grads.grad_w_mtp_head, scale);
         for sg in &mut total_grads.stage_grads {
             axiom_core::tensor::vec_scale(&mut sg.grad_norm1_gamma, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_w_conv, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_w_gate_attn, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_lambda_diff, scale);
+            axiom_core::tensor::vec_scale(&mut sg.grad_eta_rope, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_wq, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_wk, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_wv, scale);
