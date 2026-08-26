@@ -1,5 +1,5 @@
-//! Multithreaded Batch Trainer for TESSERA with Pure AVX-Accelerated AdamW Optimization.
-//! Optimized for 2,200+ tok/s training throughput and stable monotonic descent.
+//! Multithreaded Batch Trainer for TESSERA with Warmup-Stable-Decay (WSD) & AVX-Accelerated AdamW Optimization.
+//! Implements 2024–2026 WSD dynamics (MiniMax/DeepSeek) for maximum parameter learning velocity and sharp cooldown descent.
 
 use crate::tessera_model::{TesseraModel, TesseraModelGrads};
 use rand::rngs::StdRng;
@@ -197,7 +197,7 @@ pub fn evaluate_tessera_bpc(
     (mean_loss, bpc)
 }
 
-/// Multithreaded Batch Training for TESSERA.
+/// Multithreaded Batch Training for TESSERA with Warmup-Stable-Decay (WSD).
 pub fn train_tessera(
     model: &mut TesseraModel,
     train_data: &[u8],
@@ -289,19 +289,23 @@ pub fn train_tessera(
             axiom_core::tensor::vec_scale(&mut sg.grad_adapter_v, scale);
         }
 
-        let warmup = 10;
-        let min_lr = 1.0e-3f32;
-        let current_lr = if step < warmup {
-            let alpha = step as f32 / warmup as f32;
+        // Warmup-Stable-Decay (WSD): Warmup (1..10) -> Stable Plateau (11..90) -> Cooldown Annealing (91..120)
+        let warmup_steps = 10;
+        let decay_start = (max_steps as f32 * 0.75) as usize; // Step 90 out of 120
+        let min_lr = 4.0e-4f32;
+        let current_lr = if step <= warmup_steps {
+            let alpha = step as f32 / warmup_steps as f32;
             min_lr + alpha * (base_lr - min_lr)
+        } else if step <= decay_start {
+            base_lr
         } else {
-            let prog = (step - warmup) as f32 / (max_steps - warmup).max(1) as f32;
-            min_lr + 0.5 * (1.0 + (PI * prog.min(1.0)).cos()) * (base_lr - min_lr)
+            let decay_prog = (step - decay_start) as f32 / (max_steps - decay_start).max(1) as f32;
+            min_lr + 0.5 * (1.0 + (PI * decay_prog.min(1.0)).cos()) * (base_lr - min_lr)
         };
 
         optimizer.step(model, &mut total_grads, current_lr);
 
-        if step % 25 == 0 || step == 1 {
+        if step % 25 == 0 || step == 1 || step == max_steps {
             let mean_train_loss = total_loss * scale;
             let (val_loss, val_bpc) = evaluate_tessera_bpc(model, val_data, 10, seq_len);
             let elapsed = start_time.elapsed().as_secs_f64();
