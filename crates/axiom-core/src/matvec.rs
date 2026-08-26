@@ -1,5 +1,5 @@
 //! High-performance matrix-vector multiplication kernels for CPU inference and training.
-//! Designed for zero dynamic allocation and auto-vectorization across d = 512, 1024, 2048.
+//! Designed for zero dynamic allocation and auto-vectorization across d = 128, 512, 1024, 2048.
 
 use crate::tensor::{dot, vec_add_scaled, MatrixView, MatrixViewMut};
 
@@ -12,9 +12,17 @@ pub fn matvec(w: &MatrixView, x: &[f32], y: &mut [f32]) {
     debug_assert_eq!(w.cols, x.len(), "matvec: W cols != x len");
     debug_assert_eq!(w.rows, y.len(), "matvec: W rows != y len");
 
-    for r in 0..w.rows {
-        let row_slice = w.row(r);
-        y[r] = dot(row_slice, x);
+    let mut r = 0;
+    while r + 4 <= w.rows {
+        y[r] = dot(w.row(r), x);
+        y[r + 1] = dot(w.row(r + 1), x);
+        y[r + 2] = dot(w.row(r + 2), x);
+        y[r + 3] = dot(w.row(r + 3), x);
+        r += 4;
+    }
+    while r < w.rows {
+        y[r] = dot(w.row(r), x);
+        r += 1;
     }
 }
 
@@ -27,9 +35,17 @@ pub fn matvec_accumulate(w: &MatrixView, x: &[f32], y: &mut [f32]) {
     debug_assert_eq!(w.cols, x.len(), "matvec_accumulate: W cols != x len");
     debug_assert_eq!(w.rows, y.len(), "matvec_accumulate: W rows != y len");
 
-    for r in 0..w.rows {
-        let row_slice = w.row(r);
-        y[r] += dot(row_slice, x);
+    let mut r = 0;
+    while r + 4 <= w.rows {
+        y[r] += dot(w.row(r), x);
+        y[r + 1] += dot(w.row(r + 1), x);
+        y[r + 2] += dot(w.row(r + 2), x);
+        y[r + 3] += dot(w.row(r + 3), x);
+        r += 4;
+    }
+    while r < w.rows {
+        y[r] += dot(w.row(r), x);
+        r += 1;
     }
 }
 
