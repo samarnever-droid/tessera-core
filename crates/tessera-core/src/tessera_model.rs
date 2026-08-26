@@ -1,5 +1,5 @@
 //! TESSERA-Q: Quality-First Architecture with 4-Head Causal Attention + RoPE + Affine RMSNorm + Tied Embeddings + MRM-v2.
-//! Designed to beat DeepMind Griffin on BPC while retaining 100% 8K long-context recall.
+//! Calibrated for Clean Signal Propagation and Zero Allocation.
 
 use crate::mrm_v2::{MrmV2Grads, MultiResMemoryV2};
 use axiom_core::matvec::{matvec, matvec_transposed, outer_product_accumulate};
@@ -211,19 +211,19 @@ impl TesseraStage {
     ) -> Self {
         let mut rng = StdRng::seed_from_u64(seed);
         let scale_d = (1.0f32 / d_model as f32).sqrt();
-        let scale_ff = (1.0f32 / d_ff as f32).sqrt();
+        let scale_proj = (1.0f32 / (6.0 * d_model as f32)).sqrt();
         let scale_r = (1.0f32 / adapter_rank as f32).sqrt();
 
         let norm1_gamma = vec![1.0f32; d_model];
         let wq = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let wk = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let wv = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
-        let wo = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
+        let wo = (0..d_model * d_model).map(|_| rng.gen_range(-scale_proj..scale_proj)).collect();
 
         let norm2_gamma = vec![1.0f32; d_model];
         let w1 = (0..d_ff * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let w1u = (0..d_ff * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
-        let w2 = (0..d_model * d_ff).map(|_| rng.gen_range(-scale_ff..scale_ff)).collect();
+        let w2 = (0..d_model * d_ff).map(|_| rng.gen_range(-scale_proj..scale_proj)).collect();
 
         let adapter_u = (0..d_model * adapter_rank).map(|_| rng.gen_range(-scale_r..scale_r)).collect();
         let adapter_v = vec![0.0f32; adapter_rank * d_model];
@@ -371,7 +371,6 @@ impl TesseraModel {
         let n_heads = self.config.n_heads;
         let d_k = d / n_heads; // 32
         let scale_attn = 1.0f32 / (d_k as f32).sqrt();
-        let scale_embed = (d as f32).sqrt();
         let eps = 1e-5f32;
 
         let d_ff = self.stages[0].d_ff;
@@ -399,13 +398,13 @@ impl TesseraModel {
         let mut buf_pred_probs = vec![0.0f32; v];
         let mut buf_pred_grad = vec![0.0f32; v];
 
-        // 1. Initial Embedding with scale
+        // 1. Initial Clean Embedding
         let mut h_curr = vec![0.0f32; t_len * d];
         for t in 0..t_len {
             let tok = x_seq[t];
             let embed = &self.embeddings[tok * d..(tok + 1) * d];
             for i in 0..d {
-                h_curr[t * d + i] = embed[i] * scale_embed;
+                h_curr[t * d + i] = embed[i];
             }
         }
 
@@ -805,7 +804,7 @@ impl TesseraModel {
             let dh = &delta_upstream[t * d..(t + 1) * d];
             let emb_slice = &mut grads.grad_embed[tok * d..(tok + 1) * d];
             for i in 0..d {
-                emb_slice[i] += dh[i] * scale_embed;
+                emb_slice[i] += dh[i];
             }
         }
 

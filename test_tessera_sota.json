@@ -1,0 +1,16 @@
+{
+  "model": "TESSERA-Q (Native Multithreaded Rust Engine)",
+  "parameters_m": 0.73,
+  "val_loss": 2.3503,
+  "val_bpc": 3.3908,
+  "dram_bytes_per_tok": 8704,
+  "single_thread_tok_s": 1145.5,
+  "p50_us": 849.70,
+  "p90_us": 947.23,
+  "p99_us": 1541.17,
+  "needle_recall": {
+    "1024": {"recall_pct": 100.0, "avg_cosine": 0.9997},
+    "4096": {"recall_pct": 100.0, "avg_cosine": 0.9997},
+    "8192": {"recall_pct": 100.0, "avg_cosine": 0.9997}
+  }
+}
