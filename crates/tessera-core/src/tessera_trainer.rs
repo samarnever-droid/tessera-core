@@ -45,9 +45,7 @@ pub struct TesseraAdamW {
     pub max_grad_norm: f32,
     pub step: usize,
     pub m_embed: Vec<f32>, pub v_embed: Vec<f32>,
-    pub m_pos_embed: Vec<f32>, pub v_pos_embed: Vec<f32>,
     pub stage_moments: Vec<StageMoments>,
-    pub m_head: Vec<f32>, pub v_head: Vec<f32>,
 }
 
 impl TesseraAdamW {
@@ -66,18 +64,13 @@ impl TesseraAdamW {
             step: 0,
             m_embed: vec![0.0f32; model.embeddings.len()],
             v_embed: vec![0.0f32; model.embeddings.len()],
-            m_pos_embed: vec![0.0f32; model.pos_embeddings.len()],
-            v_pos_embed: vec![0.0f32; model.pos_embeddings.len()],
             stage_moments,
-            m_head: vec![0.0f32; model.head.len()],
-            v_head: vec![0.0f32; model.head.len()],
         }
     }
 
     pub fn compute_grad_norm(&self, grads: &TesseraModelGrads) -> f32 {
         let mut sum_sq = 0.0f32;
         for &g in &grads.grad_embed { sum_sq += g * g; }
-        for &g in &grads.grad_pos_embed { sum_sq += g * g; }
         for sg in &grads.stage_grads {
             for &g in &sg.grad_wq { sum_sq += g * g; }
             for &g in &sg.grad_wk { sum_sq += g * g; }
@@ -89,7 +82,6 @@ impl TesseraAdamW {
             for &g in &sg.grad_adapter_u { sum_sq += g * g; }
             for &g in &sg.grad_adapter_v { sum_sq += g * g; }
         }
-        for &g in &grads.grad_head { sum_sq += g * g; }
         sum_sq.sqrt()
     }
 
@@ -129,8 +121,6 @@ impl TesseraAdamW {
         };
 
         update_p(&mut model.embeddings, &grads.grad_embed, &mut self.m_embed, &mut self.v_embed);
-        update_p(&mut model.pos_embeddings, &grads.grad_pos_embed, &mut self.m_pos_embed, &mut self.v_pos_embed);
-        update_p(&mut model.head, &grads.grad_head, &mut self.m_head, &mut self.v_head);
 
         for ((stage, s_grads), sm) in model.stages.iter_mut().zip(grads.stage_grads.iter_mut()).zip(self.stage_moments.iter_mut()) {
             update_p(&mut stage.wq, &s_grads.grad_wq, &mut sm.m_wq, &mut sm.v_wq);
@@ -146,7 +136,6 @@ impl TesseraAdamW {
     }
 }
 
-/// Evaluate TESSERA validation loss and BPC.
 pub fn evaluate_tessera_bpc(
     model: &mut TesseraModel,
     val_data: &[u8],
@@ -256,8 +245,6 @@ pub fn train_tessera(
         }
 
         axiom_core::tensor::vec_scale(&mut total_grads.grad_embed, scale);
-        axiom_core::tensor::vec_scale(&mut total_grads.grad_pos_embed, scale);
-        axiom_core::tensor::vec_scale(&mut total_grads.grad_head, scale);
         for sg in &mut total_grads.stage_grads {
             axiom_core::tensor::vec_scale(&mut sg.grad_wq, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_wk, scale);
@@ -270,7 +257,7 @@ pub fn train_tessera(
             axiom_core::tensor::vec_scale(&mut sg.grad_adapter_v, scale);
         }
 
-        let warmup = 50;
+        let warmup = 20;
         let current_lr = if step < warmup {
             let alpha = step as f32 / warmup as f32;
             1e-4 + alpha * (base_lr - 1e-4)

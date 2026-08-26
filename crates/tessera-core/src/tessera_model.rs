@@ -1,5 +1,5 @@
-//! TESSERA-Q: Quality-First Architecture with 4-Head Causal Attention + Pre-LN RMSNorm + Progressive Folding + MRM-v2.
-//! Optimized for Zero-Allocation Execution & Maximum Representation Subspace Expressivity.
+//! TESSERA-Q: Quality-First Architecture with 4-Head Causal Attention + RoPE + Pre-LN RMSNorm + Tied Embeddings + MRM-v2.
+//! Optimized for Maximum Representation Subspace Expressivity & Zero Allocation.
 
 use crate::mrm_v2::{MrmV2Grads, MultiResMemoryV2};
 use axiom_core::matvec::{matvec, matvec_transposed, outer_product_accumulate};
@@ -39,12 +39,47 @@ pub fn rms_norm_backward(x: &[f32], rms: f32, grad_out: &[f32], grad_in: &mut [f
     }
 }
 
+/// Apply Rotary Position Embedding (RoPE) forward to a slice of size d_k for position pos
+#[inline]
+pub fn apply_rope(vec: &mut [f32], pos: usize, d_k: usize) {
+    let half = d_k / 2;
+    for i in 0..half {
+        let theta = 1.0f32 / (10000.0f32.powf((2 * i) as f32 / d_k as f32));
+        let angle = pos as f32 * theta;
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+
+        let v0 = vec[2 * i];
+        let v1 = vec[2 * i + 1];
+        vec[2 * i] = v0 * cos_a - v1 * sin_a;
+        vec[2 * i + 1] = v0 * sin_a + v1 * cos_a;
+    }
+}
+
+/// Apply Rotary Position Embedding (RoPE) backward to a gradient slice of size d_k for position pos
+#[inline]
+pub fn apply_rope_backward(d_out: &[f32], d_in: &mut [f32], pos: usize, d_k: usize) {
+    let half = d_k / 2;
+    for i in 0..half {
+        let theta = 1.0f32 / (10000.0f32.powf((2 * i) as f32 / d_k as f32));
+        let angle = pos as f32 * theta;
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+
+        let g0 = d_out[2 * i];
+        let g1 = d_out[2 * i + 1];
+        // Transposed rotation: R(-angle)
+        d_in[2 * i] = g0 * cos_a + g1 * sin_a;
+        d_in[2 * i + 1] = -g0 * sin_a + g1 * cos_a;
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct TesseraConfig {
     pub d_model: usize,
     pub d_ff: usize,
     pub n_heads: usize,       // H = 4 attention heads
-    pub n_stages: usize,      // P = 2 progressive hierarchy stages
+    pub n_stages: usize,      // P = 3 progressive hierarchy stages (1:1 with Griffin)
     pub adapter_rank: usize,  // r = 8 per-stage low-rank modulation
     pub use_mrm_v2: bool,     // Ablation flag (Arm B vs Arm C)
     pub k_fine_slots: usize,  // 128 fine slots
@@ -57,7 +92,7 @@ impl TesseraConfig {
             d_model: 128,
             d_ff: 512,
             n_heads: 4,
-            n_stages: 2,
+            n_stages: 3,
             adapter_rank: 8,
             use_mrm_v2: true,
             k_fine_slots: 128,
@@ -212,49 +247,39 @@ impl TesseraStage {
 #[derive(Debug, Clone)]
 pub struct TesseraModelGrads {
     pub grad_embed: Vec<f32>,
-    pub grad_pos_embed: Vec<f32>,
     pub stage_grads: Vec<TesseraStageGrads>,
-    pub grad_head: Vec<f32>,
 }
 
 impl TesseraModelGrads {
-    pub fn new(vocab_size: usize, d_model: usize, max_seq: usize, stages: &[TesseraStage]) -> Self {
+    pub fn new(vocab_size: usize, d_model: usize, _max_seq: usize, stages: &[TesseraStage]) -> Self {
         Self {
             grad_embed: vec![0.0f32; vocab_size * d_model],
-            grad_pos_embed: vec![0.0f32; max_seq * d_model],
             stage_grads: stages.iter().map(|s| {
                 TesseraStageGrads::new(d_model, s.d_ff, s.adapter_rank, s.mrm.is_some())
             }).collect(),
-            grad_head: vec![0.0f32; vocab_size * d_model],
         }
     }
 
     pub fn zero(&mut self) {
         self.grad_embed.fill(0.0f32);
-        self.grad_pos_embed.fill(0.0f32);
         for sg in &mut self.stage_grads { sg.zero(); }
-        self.grad_head.fill(0.0f32);
     }
 
     pub fn add(&mut self, other: &TesseraModelGrads) {
         for (a, &b) in self.grad_embed.iter_mut().zip(other.grad_embed.iter()) { *a += b; }
-        for (a, &b) in self.grad_pos_embed.iter_mut().zip(other.grad_pos_embed.iter()) { *a += b; }
         for (sg, osg) in self.stage_grads.iter_mut().zip(other.stage_grads.iter()) { sg.add(osg); }
-        for (a, &b) in self.grad_head.iter_mut().zip(other.grad_head.iter()) { *a += b; }
     }
 }
 
-/// Full TESSERA Architecture with 4-Head Multi-Head Attention & Pre-LN RMSNorm.
+/// Full TESSERA Architecture with 4-Head Attention, RoPE, Pre-LN RMSNorm, and Tied Embeddings.
 #[derive(Debug, Clone)]
 pub struct TesseraModel {
     pub vocab_size: usize,
     pub d_model: usize,
     pub max_seq_len: usize,
     pub config: TesseraConfig,
-    pub embeddings: Vec<f32>,
-    pub pos_embeddings: Vec<f32>,
+    pub embeddings: Vec<f32>, // Tied input and output embedding matrix
     pub stages: Vec<TesseraStage>,
-    pub head: Vec<f32>,
 }
 
 impl TesseraModel {
@@ -263,8 +288,6 @@ impl TesseraModel {
         let scale_d = (1.0f32 / config.d_model as f32).sqrt();
 
         let embeddings = (0..vocab_size * config.d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
-        let pos_embeddings = (0..max_seq_len * config.d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
-        let head = (0..vocab_size * config.d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
 
         let stages = (0..config.n_stages)
             .map(|p| {
@@ -287,18 +310,15 @@ impl TesseraModel {
             max_seq_len,
             config,
             embeddings,
-            pos_embeddings,
             stages,
-            head,
         }
     }
 
     pub fn parameter_metrics(&self) -> (usize, usize, usize, usize) {
-        let embed = self.vocab_size * self.d_model + self.max_seq_len * self.d_model;
-        let head = self.vocab_size * self.d_model;
+        let embed = self.vocab_size * self.d_model; // Tied embeddings
         let stage_params: usize = self.stages.iter().map(|s| s.param_count()).sum();
 
-        let total_params = embed + head + stage_params;
+        let total_params = embed + stage_params;
         let active_params = total_params;
         let dram_bytes_per_token = if self.config.use_mrm_v2 {
             self.config.k_fine_slots * 64 + self.config.k_coarse_slots * 32
@@ -310,7 +330,7 @@ impl TesseraModel {
         (total_params, active_params, dram_bytes_per_token, resident_l3_bytes)
     }
 
-    /// Full forward-backward pass through TESSERA with 4-Head Attention & Pre-LN RMSNorm.
+    /// Full forward-backward pass through TESSERA with 4-Head Attention, RoPE & Tied Embeddings.
     pub fn forward_backward_sequence(
         &mut self,
         x_seq: &[usize],
@@ -355,11 +375,9 @@ impl TesseraModel {
         let mut h_curr = vec![0.0f32; t_len * d];
         for t in 0..t_len {
             let tok = x_seq[t];
-            let pos = t.min(self.max_seq_len - 1);
             let embed = &self.embeddings[tok * d..(tok + 1) * d];
-            let pos_e = &self.pos_embeddings[pos * d..(pos + 1) * d];
             for i in 0..d {
-                h_curr[t * d + i] = (embed[i] + pos_e[i]) * scale_embed;
+                h_curr[t * d + i] = embed[i] * scale_embed;
             }
         }
 
@@ -367,15 +385,15 @@ impl TesseraModel {
         let mut stage_h_in = Vec::with_capacity(self.stages.len());
         let mut stage_hnorm1 = Vec::with_capacity(self.stages.len());
         let mut stage_rms1 = Vec::with_capacity(self.stages.len());
-        let mut stage_q = Vec::with_capacity(self.stages.len());
-        let mut stage_k = Vec::with_capacity(self.stages.len());
+        let mut stage_q_rope = Vec::with_capacity(self.stages.len());
+        let mut stage_k_rope = Vec::with_capacity(self.stages.len());
         let mut stage_v = Vec::with_capacity(self.stages.len());
-        let mut stage_attn_probs = Vec::with_capacity(self.stages.len()); // (n_heads x t_len x t_len)
+        let mut stage_attn_probs = Vec::with_capacity(self.stages.len());
         let mut stage_h_mid = Vec::with_capacity(self.stages.len());
         let mut stage_hnorm2 = Vec::with_capacity(self.stages.len());
         let mut stage_rms2 = Vec::with_capacity(self.stages.len());
 
-        // 2. Progressive Folding Stages with Pre-LN RMSNorm
+        // 2. Progressive Folding Stages with Pre-LN RMSNorm + RoPE
         for stage in &mut self.stages {
             let h_in = h_curr.clone();
             stage_h_in.push(h_in.clone());
@@ -406,6 +424,13 @@ impl TesseraModel {
                 matvec(&wq_v, ht, &mut q_mat[t * d..(t + 1) * d]);
                 matvec(&wk_v, ht, &mut k_mat[t * d..(t + 1) * d]);
                 matvec(&wv_v, ht, &mut v_mat[t * d..(t + 1) * d]);
+
+                // Apply Rotary Position Embeddings (RoPE) to Q and K per head
+                for h in 0..n_heads {
+                    let h_offset = h * d_k;
+                    apply_rope(&mut q_mat[t * d + h_offset..t * d + h_offset + d_k], t, d_k);
+                    apply_rope(&mut k_mat[t * d + h_offset..t * d + h_offset + d_k], t, d_k);
+                }
             }
 
             let mut attn_probs = vec![0.0f32; n_heads * t_len * t_len];
@@ -440,8 +465,8 @@ impl TesseraModel {
                 vec_add_scaled(out_slice, &buf_proj_out, 1.0);
             }
 
-            stage_q.push(q_mat);
-            stage_k.push(k_mat);
+            stage_q_rope.push(q_mat);
+            stage_k_rope.push(k_mat);
             stage_v.push(v_mat);
             stage_attn_probs.push(attn_probs);
             stage_h_mid.push(h_after_attn.clone());
@@ -497,7 +522,7 @@ impl TesseraModel {
             h_curr = h_stage_out;
         }
 
-        // 3. Final RMSNorm + Output Head
+        // 3. Final RMSNorm + Tied Output Logits
         let mut h_final_norm = vec![0.0f32; t_len * d];
         let mut rms_final = vec![0.0f32; t_len];
         for t in 0..t_len {
@@ -506,21 +531,21 @@ impl TesseraModel {
             rms_final[t] = rms_norm(ht, out_t, eps);
         }
 
-        let head_view = MatrixView::new(&self.head, v, d);
-        let mut grad_head_view = MatrixViewMut::new(&mut grads.grad_head, v, d);
+        let embed_view = MatrixView::new(&self.embeddings, v, d);
+        let mut grad_embed_view = MatrixViewMut::new(&mut grads.grad_embed, v, d);
         let mut delta_head = vec![0.0f32; t_len * d];
         let mut total_loss = 0.0f32;
 
         for t in 0..t_len {
             let ht = &h_final_norm[t * d..(t + 1) * d];
 
-            matvec(&head_view, ht, &mut buf_logits);
+            matvec(&embed_view, ht, &mut buf_logits);
             let loss = cross_entropy_loss_and_grad(&buf_logits, y_seq[t], &mut buf_pred_probs, &mut buf_pred_grad);
             total_loss += loss;
 
-            outer_product_accumulate(&buf_pred_grad, ht, 1.0, &mut grad_head_view);
+            outer_product_accumulate(&buf_pred_grad, ht, 1.0, &mut grad_embed_view);
             let d_ht = &mut delta_head[t * d..(t + 1) * d];
-            matvec_transposed(&head_view, &buf_pred_grad, d_ht);
+            matvec_transposed(&embed_view, &buf_pred_grad, d_ht);
         }
 
         // Backprop through Final RMSNorm
@@ -541,8 +566,8 @@ impl TesseraModel {
             let h_mid = &stage_h_mid[s_idx];
             let h_norm2 = &stage_hnorm2[s_idx];
             let rms2 = &stage_rms2[s_idx];
-            let q_mat = &stage_q[s_idx];
-            let k_mat = &stage_k[s_idx];
+            let q_mat = &stage_q_rope[s_idx];
+            let k_mat = &stage_k_rope[s_idx];
             let v_mat = &stage_v[s_idx];
             let attn_probs = &stage_attn_probs[s_idx];
 
@@ -637,8 +662,8 @@ impl TesseraModel {
                 matvec_transposed(&wo_v, dh, &mut d_attn_out[t * d..(t + 1) * d]);
             }
 
-            let mut dq_mat = vec![0.0f32; t_len * d];
-            let mut dk_mat = vec![0.0f32; t_len * d];
+            let mut dq_rope = vec![0.0f32; t_len * d];
+            let mut dk_rope = vec![0.0f32; t_len * d];
             let mut dv_mat = vec![0.0f32; t_len * d];
 
             for h in 0..n_heads {
@@ -662,9 +687,30 @@ impl TesseraModel {
                         let d_score_j = (cur_d_scores[j] - p_ij * sum_dp) * scale_attn;
                         let kj = &k_mat[j * d + h_offset..j * d + h_offset + d_k];
 
-                        vec_add_scaled(&mut dq_mat[i * d + h_offset..i * d + h_offset + d_k], kj, d_score_j);
-                        vec_add_scaled(&mut dk_mat[j * d + h_offset..j * d + h_offset + d_k], qi, d_score_j);
+                        vec_add_scaled(&mut dq_rope[i * d + h_offset..i * d + h_offset + d_k], kj, d_score_j);
+                        vec_add_scaled(&mut dk_rope[j * d + h_offset..j * d + h_offset + d_k], qi, d_score_j);
                     }
+                }
+            }
+
+            // Backprop through RoPE rotation for Q and K
+            let mut dq_mat = vec![0.0f32; t_len * d];
+            let mut dk_mat = vec![0.0f32; t_len * d];
+            for t in 0..t_len {
+                for h in 0..n_heads {
+                    let h_offset = h * d_k;
+                    apply_rope_backward(
+                        &dq_rope[t * d + h_offset..t * d + h_offset + d_k],
+                        &mut dq_mat[t * d + h_offset..t * d + h_offset + d_k],
+                        t,
+                        d_k,
+                    );
+                    apply_rope_backward(
+                        &dk_rope[t * d + h_offset..t * d + h_offset + d_k],
+                        &mut dk_mat[t * d + h_offset..t * d + h_offset + d_k],
+                        t,
+                        d_k,
+                    );
                 }
             }
 
@@ -704,17 +750,13 @@ impl TesseraModel {
             delta_upstream = delta_in;
         }
 
-        // 5. Backprop to Embeddings
+        // 5. Backprop to Tied Input Embeddings
         for t in 0..t_len {
             let tok = x_seq[t];
-            let pos = t.min(self.max_seq_len - 1);
             let dh = &delta_upstream[t * d..(t + 1) * d];
             let emb_slice = &mut grads.grad_embed[tok * d..(tok + 1) * d];
-            let pos_slice = &mut grads.grad_pos_embed[pos * d..(pos + 1) * d];
             for i in 0..d {
-                let grad_scaled = dh[i] * scale_embed;
-                emb_slice[i] += grad_scaled;
-                pos_slice[i] += grad_scaled;
+                emb_slice[i] += dh[i] * scale_embed;
             }
         }
 
