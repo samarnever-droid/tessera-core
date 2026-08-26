@@ -1,0 +1,17 @@
+[package]
+name = "mneme-core"
+version = "0.1.0"
+edition = "2021"
+description = "MNEME pre-build falsification harness: cache-resident recurrent trunk, gated delta-rule mixer, sparse product-key expert tier, depth-recurrence, and ablation suite E1-E7"
+
+[dependencies]
+axiom-core     = { path = "../axiom-core" }
+axiom-baseline = { path = "../axiom-baseline" }
+axiom-train    = { path = "../axiom-train" }
+rand           = "0.8"
+rayon          = "1.10"
+sysinfo        = "0.30"
+
+[[bin]]
+name = "mneme-exp"
+path = "src/bin/mneme_exp.rs"

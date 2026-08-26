@@ -1,0 +1,17 @@
+[package]
+name = "forge-core"
+version = "0.1.0"
+edition = "2021"
+description = "FORGE falsification harness: content-addressable memory, surprise gating, fast-weight adaptation, and ablation experiments E1-E6"
+
+[dependencies]
+axiom-core    = { path = "../axiom-core" }
+axiom-baseline = { path = "../axiom-baseline" }
+axiom-train   = { path = "../axiom-train" }
+rand          = "0.8"
+rayon         = "1.10"
+sysinfo       = "0.30"
+
+[[bin]]
+name = "forge-exp"
+path = "src/bin/forge_exp.rs"

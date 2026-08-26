@@ -1,0 +1,17 @@
+[package]
+name = "tessera-core"
+version = "0.1.0"
+edition = "2021"
+description = "TESSERA: Temporal-Hierarchical State with Structured Resonance & Active Working Memory"
+
+[dependencies]
+axiom-core     = { path = "../axiom-core" }
+axiom-baseline = { path = "../axiom-baseline" }
+axiom-train    = { path = "../axiom-train" }
+rand           = "0.8"
+rayon          = "1.10"
+sysinfo        = "0.30"
+
+[[bin]]
+name = "tessera-exp"
+path = "src/bin/tessera_exp.rs"

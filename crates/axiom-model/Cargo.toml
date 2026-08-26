@@ -1,0 +1,10 @@
+[package]
+name = "axiom-model"
+version = "0.1.0"
+edition = "2021"
+description = "AXIOM LayerState, forward pass, and decoupled sparse expert model"
+
+[dependencies]
+axiom-core = { path = "../axiom-core" }
+rand = "0.8"
+rayon = "1.10"

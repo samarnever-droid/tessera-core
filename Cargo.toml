@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "crates/axiom-core",
+    "crates/axiom-model",
+    "crates/axiom-train",
+    "crates/axiom-infer",
+    "crates/axiom-baseline",
+    "crates/axiom-bench",
+    "crates/stratum-core",
+    "crates/forge-core",
+    "crates/mneme-core",
+    "crates/tessera-core",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false

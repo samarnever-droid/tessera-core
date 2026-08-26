@@ -1,0 +1,11 @@
+[package]
+name = "axiom-train"
+version = "0.1.0"
+edition = "2021"
+description = "Decoupled parallel layer training, local loss, AdamW, and batch loop for AXIOM"
+
+[dependencies]
+axiom-core = { path = "../axiom-core" }
+axiom-model = { path = "../axiom-model" }
+rand = "0.8"
+rayon = "1.10"

@@ -1,0 +1,21 @@
+[package]
+name = "axiom-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Benchmark harness for AXIOM kernels, throughput, latency, and memory"
+
+[dependencies]
+axiom-core = { path = "../axiom-core" }
+axiom-model = { path = "../axiom-model" }
+axiom-train = { path = "../axiom-train" }
+axiom-infer = { path = "../axiom-infer" }
+axiom-baseline = { path = "../axiom-baseline" }
+rand = "0.8"
+sysinfo = "0.30"
+
+[[bench]]
+name = "kernel_bench"
+harness = false
+
+[dev-dependencies]
+criterion = "0.5"

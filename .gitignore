@@ -1,0 +1,7 @@
+/target
+/.venv
+/__pycache__
+/data/enwik8
+/data/enwik8.zip
+/vendor/recurrentgemma/.git
+*.pyc

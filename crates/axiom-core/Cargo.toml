@@ -1,0 +1,11 @@
+[package]
+name = "axiom-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core linear algebra, SIMD kernels, top-k, softmax, buffer, and Hebbian memory for AXIOM"
+
+[dependencies]
+rand = "0.8"
+
+[dev-dependencies]
+rand = "0.8"

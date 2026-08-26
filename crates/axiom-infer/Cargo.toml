@@ -1,0 +1,10 @@
+[package]
+name = "axiom-infer"
+version = "0.1.0"
+edition = "2021"
+description = "Autoregressive generation with O(1) state and buffer attention for AXIOM"
+
+[dependencies]
+axiom-core = { path = "../axiom-core" }
+axiom-model = { path = "../axiom-model" }
+rand = "0.8"

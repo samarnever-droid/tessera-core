@@ -1,0 +1,10 @@
+[package]
+name = "axiom-baseline"
+version = "0.1.0"
+edition = "2021"
+description = "Reference standard recurrent and Transformer baselines with matched parameter counts"
+
+[dependencies]
+axiom-core = { path = "../axiom-core" }
+rand = "0.8"
+rayon = "1.10"
