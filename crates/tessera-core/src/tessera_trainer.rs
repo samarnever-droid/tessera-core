@@ -278,13 +278,14 @@ pub fn train_tessera(
             axiom_core::tensor::vec_scale(&mut sg.grad_adapter_v, scale);
         }
 
-        let warmup = 15;
+        let warmup = 10;
+        let min_lr = 1.0e-3f32;
         let current_lr = if step < warmup {
             let alpha = step as f32 / warmup as f32;
-            1e-4 + alpha * (base_lr - 1e-4)
+            min_lr + alpha * (base_lr - min_lr)
         } else {
             let prog = (step - warmup) as f32 / (max_steps - warmup).max(1) as f32;
-            1e-4 + 0.5 * (1.0 + (PI * prog.min(1.0)).cos()) * (base_lr - 1e-4)
+            min_lr + 0.5 * (1.0 + (PI * prog.min(1.0)).cos()) * (base_lr - min_lr)
         };
 
         optimizer.step(model, &mut total_grads, current_lr);

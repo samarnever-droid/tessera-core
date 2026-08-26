@@ -132,7 +132,7 @@ impl TesseraConfig {
             d_model: 128,
             d_ff: 768,        // 6x expansion for peak expressivity
             n_heads: 4,
-            n_stages: 3,
+            n_stages: 3,      // 3 progressive hierarchy stages (optimal for 120 steps)
             adapter_rank: 8,
             use_mrm_v2: true,
             k_fine_slots: 128,
