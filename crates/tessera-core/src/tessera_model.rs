@@ -1,4 +1,4 @@
-//! TESSERA-Q: Frontier Architecture with Gated Attention (GAU) + Depthwise 1D Causal Conv + QK-Norm + Value Residual (ResFormer) + RoPE + Affine RMSNorm + Tied Logits + Z-Loss + MRM-v2.
+//! TESSERA-Q: Frontier Architecture with Microsoft Differential Attention (DiffAttn) + Gated Attention (GAU) + Depthwise 1D Causal Conv + QK-Norm + Value Residual (ResFormer) + RoPE + Affine RMSNorm + Tied Logits + Z-Loss + MRM-v2.
 //! Engineered to systematically surpass Google DeepMind Griffin on Character BPC while retaining 100% 8K long-context recall.
 
 use crate::mrm_v2::{MrmV2Grads, MultiResMemoryV2};
@@ -118,7 +118,7 @@ pub fn apply_rope_backward(d_out: &[f32], d_in: &mut [f32], pos: usize, d_k: usi
 pub struct TesseraConfig {
     pub d_model: usize,
     pub d_ff: usize,
-    pub n_heads: usize,       // H = 4 attention heads
+    pub n_heads: usize,       // H = 4 attention sub-heads (2 differential head pairs)
     pub n_stages: usize,      // P = 3 progressive hierarchy stages
     pub adapter_rank: usize,  // r = 8 per-stage low-rank modulation
     pub use_mrm_v2: bool,     // Ablation flag (Arm B vs Arm C)
@@ -146,6 +146,7 @@ pub struct TesseraStageGrads {
     pub grad_norm1_gamma: Vec<f32>,
     pub grad_w_conv: Vec<f32>,      // (4 x d)
     pub grad_w_gate_attn: Vec<f32>, // (d x d) Gated Temporal Unit
+    pub grad_lambda_diff: Vec<f32>, // (2) Differential Attention Lambda
     pub grad_wq: Vec<f32>,
     pub grad_wk: Vec<f32>,
     pub grad_wv: Vec<f32>,
@@ -165,6 +166,7 @@ impl TesseraStageGrads {
             grad_norm1_gamma: vec![0.0f32; d],
             grad_w_conv: vec![0.0f32; 4 * d],
             grad_w_gate_attn: vec![0.0f32; d * d],
+            grad_lambda_diff: vec![0.0f32; 2],
             grad_wq: vec![0.0f32; d * d],
             grad_wk: vec![0.0f32; d * d],
             grad_wv: vec![0.0f32; d * d],
@@ -183,6 +185,7 @@ impl TesseraStageGrads {
         self.grad_norm1_gamma.fill(0.0f32);
         self.grad_w_conv.fill(0.0f32);
         self.grad_w_gate_attn.fill(0.0f32);
+        self.grad_lambda_diff.fill(0.0f32);
         self.grad_wq.fill(0.0f32);
         self.grad_wk.fill(0.0f32);
         self.grad_wv.fill(0.0f32);
@@ -200,6 +203,7 @@ impl TesseraStageGrads {
         for (a, &b) in self.grad_norm1_gamma.iter_mut().zip(other.grad_norm1_gamma.iter()) { *a += b; }
         for (a, &b) in self.grad_w_conv.iter_mut().zip(other.grad_w_conv.iter()) { *a += b; }
         for (a, &b) in self.grad_w_gate_attn.iter_mut().zip(other.grad_w_gate_attn.iter()) { *a += b; }
+        for (a, &b) in self.grad_lambda_diff.iter_mut().zip(other.grad_lambda_diff.iter()) { *a += b; }
         for (a, &b) in self.grad_wq.iter_mut().zip(other.grad_wq.iter()) { *a += b; }
         for (a, &b) in self.grad_wk.iter_mut().zip(other.grad_wk.iter()) { *a += b; }
         for (a, &b) in self.grad_wv.iter_mut().zip(other.grad_wv.iter()) { *a += b; }
@@ -216,7 +220,7 @@ impl TesseraStageGrads {
     }
 }
 
-/// A Progressive Hierarchy Stage with Gated Attention + 1D Conv + 4-Head Attention + QK-Norm + Value Residual + RoPE + Affine RMSNorm + SwiGLU + MRM-v2.
+/// A Progressive Hierarchy Stage with Microsoft Differential Attention + Gated Attention + 1D Conv + QK-Norm + Value Residual + RoPE + Affine RMSNorm + SwiGLU + MRM-v2.
 #[derive(Debug, Clone)]
 pub struct TesseraStage {
     pub d_model: usize,
@@ -226,6 +230,7 @@ pub struct TesseraStage {
     pub norm1_gamma: Vec<f32>,
     pub w_conv: Vec<f32>,      // (4 x d) Depthwise Causal 1D Convolution
     pub w_gate_attn: Vec<f32>, // (d x d) Gated Temporal Unit
+    pub lambda_diff: Vec<f32>, // (2) Differential Attention noise cancellation lambda
     pub wq: Vec<f32>,
     pub wk: Vec<f32>,
     pub wv: Vec<f32>,
@@ -267,6 +272,7 @@ impl TesseraStage {
         }
 
         let w_gate_attn = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
+        let lambda_diff = vec![0.8f32; 2]; // Initialized to standard Diff-Transformer lambda = 0.8
         let wq = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let wk = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let wv = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
@@ -294,6 +300,7 @@ impl TesseraStage {
             norm1_gamma,
             w_conv,
             w_gate_attn,
+            lambda_diff,
             wq,
             wk,
             wv,
@@ -312,11 +319,12 @@ impl TesseraStage {
         let norms = 2 * self.d_model;
         let conv = 4 * self.d_model;
         let gate = self.d_model * self.d_model;
+        let lambda = self.lambda_diff.len();
         let attn = 4 * (self.d_model * self.d_model);
         let dense = 2 * (self.d_ff * self.d_model) + (self.d_model * self.d_ff);
         let adapter = 2 * (self.d_model * self.adapter_rank);
         let mrm_p = self.mrm.as_ref().map(|m| m.param_count()).unwrap_or(0);
-        norms + conv + gate + attn + dense + adapter + mrm_p
+        norms + conv + gate + lambda + attn + dense + adapter + mrm_p
     }
 }
 
@@ -351,7 +359,7 @@ impl TesseraModelGrads {
     }
 }
 
-/// Full TESSERA Architecture with Gated Attention + 1D Conv + QK-Norm + Value Residual + RoPE + Affine RMSNorm + Tied Logits + Z-Loss.
+/// Full TESSERA Architecture with Microsoft Differential Attention + Gated Attention + 1D Conv + QK-Norm + Value Residual + RoPE + Affine RMSNorm + Tied Logits + Z-Loss.
 #[derive(Debug, Clone)]
 pub struct TesseraModel {
     pub vocab_size: usize,
@@ -414,7 +422,7 @@ impl TesseraModel {
         (total_params, active_params, dram_bytes_per_token, resident_l3_bytes)
     }
 
-    /// Full forward-backward pass through TESSERA with Gated Attention + 1D Conv + QK-Norm + Value Residual + Z-Loss.
+    /// Full forward-backward pass through TESSERA with Microsoft Differential Attention + Gated Attention + 1D Conv + QK-Norm + Value Residual + Z-Loss.
     pub fn forward_backward_sequence(
         &mut self,
         x_seq: &[usize],
@@ -424,8 +432,10 @@ impl TesseraModel {
         let t_len = x_seq.len();
         let d = self.d_model;
         let v = self.vocab_size;
-        let n_heads = self.config.n_heads;
-        let d_k = d / n_heads; // 32
+        let n_subheads = self.config.n_heads; // 4 sub-heads
+        let n_pairs = n_subheads / 2;         // 2 differential head pairs
+        let d_k = d / n_subheads;             // 32
+        let d_v_pair = d / n_pairs;           // 64
         let scale_attn = 1.0f32 / (d_k as f32).sqrt();
         let eps = 1e-5f32;
         let logit_cap = 30.0f32;
@@ -435,8 +445,6 @@ impl TesseraModel {
         let r_adapt = self.stages[0].adapter_rank;
 
         // Reusable scratch buffers allocated ONCE per sequence call
-        let mut buf_gate_attn_raw = vec![0.0f32; d];
-        let mut buf_gate_attn_act = vec![0.0f32; d];
         let mut buf_gate = vec![0.0f32; d_ff];
         let mut buf_up = vec![0.0f32; d_ff];
         let mut buf_ff = vec![0.0f32; d_ff];
@@ -451,8 +459,10 @@ impl TesseraModel {
         let mut buf_d_hn_up = vec![0.0f32; d];
         let mut buf_d_hn_adapt = vec![0.0f32; d];
         let mut buf_tmp = vec![0.0f32; d];
-        let mut buf_scores = vec![0.0f32; t_len];
-        let mut buf_probs = vec![0.0f32; t_len];
+        let mut buf_scores1 = vec![0.0f32; t_len];
+        let mut buf_probs1 = vec![0.0f32; t_len];
+        let mut buf_scores2 = vec![0.0f32; t_len];
+        let mut buf_probs2 = vec![0.0f32; t_len];
         let mut buf_d_scores = vec![0.0f32; t_len];
         let mut buf_raw_logits = vec![0.0f32; v];
         let mut buf_capped_logits = vec![0.0f32; v];
@@ -485,7 +495,7 @@ impl TesseraModel {
         let mut stage_v = Vec::with_capacity(self.stages.len());
         let mut stage_attn_temporal = Vec::with_capacity(self.stages.len());
         let mut stage_attn_fused = Vec::with_capacity(self.stages.len());
-        let mut stage_attn_probs = Vec::with_capacity(self.stages.len());
+        let mut stage_attn_probs_all = Vec::with_capacity(self.stages.len());
         let mut stage_h_mid = Vec::with_capacity(self.stages.len());
         let mut stage_hnorm2 = Vec::with_capacity(self.stages.len());
         let mut stage_rms2 = Vec::with_capacity(self.stages.len());
@@ -542,7 +552,7 @@ impl TesseraModel {
             }
             stage_h_conv.push(h_conv.clone());
 
-            // D. 4-Head Causal Self-Attention with QK-Norm, Value Residual, & RoPE
+            // D. Microsoft Differential Attention (DiffAttn) with 2 Pairs (4 Sub-Heads) + QK-Norm + Value Residual + RoPE
             let wq_v = MatrixView::new(&stage.wq, d, d);
             let wk_v = MatrixView::new(&stage.wk, d, d);
             let wv_v = MatrixView::new(&stage.wv, d, d);
@@ -558,8 +568,8 @@ impl TesseraModel {
                 matvec(&wk_v, ht, &mut k_mat[t * d..(t + 1) * d]);
                 matvec(&wv_v, ht, &mut v_mat[t * d..(t + 1) * d]);
 
-                // RoPE on raw Q and K
-                for h in 0..n_heads {
+                // RoPE on each of the 4 sub-heads
+                for h in 0..n_subheads {
                     let h_offset = h * d_k;
                     apply_rope(&mut q_mat[t * d + h_offset..t * d + h_offset + d_k], t, d_k);
                     apply_rope(&mut k_mat[t * d + h_offset..t * d + h_offset + d_k], t, d_k);
@@ -578,22 +588,22 @@ impl TesseraModel {
             stage_q_raw.push(q_mat.clone());
             stage_k_raw.push(k_mat.clone());
 
-            // QK-Norm: RMSNorm on each Q and K head
+            // QK-Norm: RMSNorm on each sub-head
             let mut q_norm = vec![0.0f32; t_len * d];
             let mut k_norm = vec![0.0f32; t_len * d];
-            let mut q_rms = vec![0.0f32; t_len * n_heads];
-            let mut k_rms = vec![0.0f32; t_len * n_heads];
+            let mut q_rms = vec![0.0f32; t_len * n_subheads];
+            let mut k_rms = vec![0.0f32; t_len * n_subheads];
 
             for t in 0..t_len {
-                for h in 0..n_heads {
+                for h in 0..n_subheads {
                     let h_offset = h * d_k;
                     let q_head = &q_mat[t * d + h_offset..t * d + h_offset + d_k];
                     let k_head = &k_mat[t * d + h_offset..t * d + h_offset + d_k];
                     let q_out = &mut q_norm[t * d + h_offset..t * d + h_offset + d_k];
                     let k_out = &mut k_norm[t * d + h_offset..t * d + h_offset + d_k];
 
-                    q_rms[t * n_heads + h] = rms_norm_head(q_head, q_out, eps);
-                    k_rms[t * n_heads + h] = rms_norm_head(k_head, k_out, eps);
+                    q_rms[t * n_subheads + h] = rms_norm_head(q_head, q_out, eps);
+                    k_rms[t * n_subheads + h] = rms_norm_head(k_head, k_out, eps);
                 }
             }
 
@@ -602,26 +612,47 @@ impl TesseraModel {
             stage_q_rms.push(q_rms);
             stage_k_rms.push(k_rms);
 
-            let mut attn_probs = vec![0.0f32; n_heads * t_len * t_len];
+            // 4 sub-head probability maps (2 pairs: [P0_1, P0_2], [P1_1, P1_2])
+            let mut attn_probs_all = vec![0.0f32; n_subheads * t_len * t_len];
             let mut attn_temporal = vec![0.0f32; t_len * d];
 
-            for h in 0..n_heads {
-                let h_offset = h * d_k;
+            for p in 0..n_pairs {
+                let h1 = 2 * p;
+                let h2 = 2 * p + 1;
+                let h1_offset = h1 * d_k;
+                let h2_offset = h2 * d_k;
+                let v_offset = p * d_v_pair;
+                let lambda = stage.lambda_diff[p];
+
                 for i in 0..t_len {
-                    let qi = &q_norm[i * d + h_offset..i * d + h_offset + d_k];
-                    let cur_scores = &mut buf_scores[..=i];
-                    let cur_probs = &mut buf_probs[..=i];
+                    let q1_i = &q_norm[i * d + h1_offset..i * d + h1_offset + d_k];
+                    let q2_i = &q_norm[i * d + h2_offset..i * d + h2_offset + d_k];
+
+                    let cur_s1 = &mut buf_scores1[..=i];
+                    let cur_p1 = &mut buf_probs1[..=i];
+                    let cur_s2 = &mut buf_scores2[..=i];
+                    let cur_p2 = &mut buf_probs2[..=i];
 
                     for j in 0..=i {
-                        let kj = &k_norm[j * d + h_offset..j * d + h_offset + d_k];
-                        cur_scores[j] = dot(qi, kj) * scale_attn;
+                        let k1_j = &k_norm[j * d + h1_offset..j * d + h1_offset + d_k];
+                        let k2_j = &k_norm[j * d + h2_offset..j * d + h2_offset + d_k];
+                        cur_s1[j] = dot(q1_i, k1_j) * scale_attn;
+                        cur_s2[j] = dot(q2_i, k2_j) * scale_attn;
                     }
-                    softmax(cur_scores, cur_probs);
+
+                    softmax(cur_s1, cur_p1);
+                    softmax(cur_s2, cur_p2);
 
                     for j in 0..=i {
-                        attn_probs[h * (t_len * t_len) + i * t_len + j] = cur_probs[j];
-                        let vj = &v_mat[j * d + h_offset..j * d + h_offset + d_k];
-                        vec_add_scaled(&mut attn_temporal[i * d + h_offset..i * d + h_offset + d_k], vj, cur_probs[j]);
+                        let p1_val = cur_p1[j];
+                        let p2_val = cur_p2[j];
+                        attn_probs_all[h1 * (t_len * t_len) + i * t_len + j] = p1_val;
+                        attn_probs_all[h2 * (t_len * t_len) + i * t_len + j] = p2_val;
+
+                        // Differential Attention Map: A_diff = Softmax(Q1 K1^T) - lambda * Softmax(Q2 K2^T)
+                        let diff_weight = p1_val - lambda * p2_val;
+                        let vj = &v_mat[j * d + v_offset..j * d + v_offset + d_v_pair];
+                        vec_add_scaled(&mut attn_temporal[i * d + v_offset..i * d + v_offset + d_v_pair], vj, diff_weight);
                     }
                 }
             }
@@ -643,7 +674,7 @@ impl TesseraModel {
             stage_v.push(v_mat);
             stage_attn_temporal.push(attn_temporal);
             stage_attn_fused.push(attn_fused);
-            stage_attn_probs.push(attn_probs);
+            stage_attn_probs_all.push(attn_probs_all);
             stage_h_mid.push(h_after_attn.clone());
 
             // E. Pre-LN Affine RMSNorm 2
@@ -791,7 +822,7 @@ impl TesseraModel {
             let v_mat = &stage_v[s_idx];
             let attn_temporal = &stage_attn_temporal[s_idx];
             let attn_fused = &stage_attn_fused[s_idx];
-            let attn_probs = &stage_attn_probs[s_idx];
+            let attn_probs_all = &stage_attn_probs_all[s_idx];
 
             // SwiGLU + Adapter Backward
             let w1_v = MatrixView::new(&stage.w1, stage.d_ff, d);
@@ -909,38 +940,70 @@ impl TesseraModel {
                 matvec_transposed(&w_gate_v, dg, &mut delta_hnorm1_gate[t * d..(t + 1) * d]);
             }
 
-            // Causal Self-Attention Backward
-            let mut gwq = MatrixViewMut::new(&mut s_grads.grad_wq, d, d);
-            let mut gwk = MatrixViewMut::new(&mut s_grads.grad_wk, d, d);
-            let mut gwv = MatrixViewMut::new(&mut s_grads.grad_wv, d, d);
-
+            // Microsoft Differential Attention Backward
             let mut dq_norm = vec![0.0f32; t_len * d];
             let mut dk_norm = vec![0.0f32; t_len * d];
             let mut dv_mat = vec![0.0f32; t_len * d];
 
-            for h in 0..n_heads {
-                let h_offset = h * d_k;
-                for i in 0..t_len {
-                    let d_out_i = &d_attn_temporal[i * d + h_offset..i * d + h_offset + d_k];
-                    let qi = &q_norm[i * d + h_offset..i * d + h_offset + d_k];
+            for p in 0..n_pairs {
+                let h1 = 2 * p;
+                let h2 = 2 * p + 1;
+                let h1_offset = h1 * d_k;
+                let h2_offset = h2 * d_k;
+                let v_offset = p * d_v_pair;
+                let lambda = stage.lambda_diff[p];
 
-                    let cur_d_scores = &mut buf_d_scores[..=i];
+                for i in 0..t_len {
+                    let d_out_i = &d_attn_temporal[i * d + v_offset..i * d + v_offset + d_v_pair];
+                    let q1_i = &q_norm[i * d + h1_offset..i * d + h1_offset + d_k];
+                    let q2_i = &q_norm[i * d + h2_offset..i * d + h2_offset + d_k];
+
+                    // 1. Backprop into V_mat: dV_j += d_out_i * (p1_ij - lambda * p2_ij)
                     for j in 0..=i {
-                        let p_ij = attn_probs[h * (t_len * t_len) + i * t_len + j];
-                        let vj = &v_mat[j * d + h_offset..j * d + h_offset + d_k];
+                        let p1_ij = attn_probs_all[h1 * (t_len * t_len) + i * t_len + j];
+                        let p2_ij = attn_probs_all[h2 * (t_len * t_len) + i * t_len + j];
+                        let diff_weight = p1_ij - lambda * p2_ij;
+
+                        vec_add_scaled(&mut dv_mat[j * d + v_offset..j * d + v_offset + d_v_pair], d_out_i, diff_weight);
+
+                        // Gradient for lambda: - (d_out_i . v_j) * p2_ij
+                        let vj = &v_mat[j * d + v_offset..j * d + v_offset + d_v_pair];
                         let dot_v = dot(d_out_i, vj);
-                        cur_d_scores[j] = p_ij * dot_v;
-                        vec_add_scaled(&mut dv_mat[j * d + h_offset..j * d + h_offset + d_k], d_out_i, p_ij);
+                        s_grads.grad_lambda_diff[p] -= dot_v * p2_ij;
                     }
 
-                    let sum_dp: f32 = cur_d_scores.iter().sum();
+                    // 2. Backprop into Q1, K1 (through Map 1 Softmax)
+                    let cur_d_scores1 = &mut buf_d_scores[..=i];
                     for j in 0..=i {
-                        let p_ij = attn_probs[h * (t_len * t_len) + i * t_len + j];
-                        let d_score_j = (cur_d_scores[j] - p_ij * sum_dp) * scale_attn;
-                        let kj = &k_norm[j * d + h_offset..j * d + h_offset + d_k];
+                        let p1_ij = attn_probs_all[h1 * (t_len * t_len) + i * t_len + j];
+                        let vj = &v_mat[j * d + v_offset..j * d + v_offset + d_v_pair];
+                        cur_d_scores1[j] = p1_ij * dot(d_out_i, vj);
+                    }
+                    let sum_dp1: f32 = cur_d_scores1.iter().sum();
+                    for j in 0..=i {
+                        let p1_ij = attn_probs_all[h1 * (t_len * t_len) + i * t_len + j];
+                        let d_score_j = (cur_d_scores1[j] - p1_ij * sum_dp1) * scale_attn;
+                        let k1_j = &k_norm[j * d + h1_offset..j * d + h1_offset + d_k];
 
-                        vec_add_scaled(&mut dq_norm[i * d + h_offset..i * d + h_offset + d_k], kj, d_score_j);
-                        vec_add_scaled(&mut dk_norm[j * d + h_offset..j * d + h_offset + d_k], qi, d_score_j);
+                        vec_add_scaled(&mut dq_norm[i * d + h1_offset..i * d + h1_offset + d_k], k1_j, d_score_j);
+                        vec_add_scaled(&mut dk_norm[j * d + h1_offset..j * d + h1_offset + d_k], q1_i, d_score_j);
+                    }
+
+                    // 3. Backprop into Q2, K2 (through Map 2 Softmax with -lambda scale)
+                    let cur_d_scores2 = &mut buf_d_scores[..=i];
+                    for j in 0..=i {
+                        let p2_ij = attn_probs_all[h2 * (t_len * t_len) + i * t_len + j];
+                        let vj = &v_mat[j * d + v_offset..j * d + v_offset + d_v_pair];
+                        cur_d_scores2[j] = -lambda * p2_ij * dot(d_out_i, vj);
+                    }
+                    let sum_dp2: f32 = cur_d_scores2.iter().sum();
+                    for j in 0..=i {
+                        let p2_ij = attn_probs_all[h2 * (t_len * t_len) + i * t_len + j];
+                        let d_score_j = (cur_d_scores2[j] - p2_ij * sum_dp2) * scale_attn;
+                        let k2_j = &k_norm[j * d + h2_offset..j * d + h2_offset + d_k];
+
+                        vec_add_scaled(&mut dq_norm[i * d + h2_offset..i * d + h2_offset + d_k], k2_j, d_score_j);
+                        vec_add_scaled(&mut dk_norm[j * d + h2_offset..j * d + h2_offset + d_k], q2_i, d_score_j);
                     }
                 }
             }
@@ -962,7 +1025,7 @@ impl TesseraModel {
             let mut dk_rope = vec![0.0f32; t_len * d];
 
             for t in 0..t_len {
-                for h in 0..n_heads {
+                for h in 0..n_subheads {
                     let h_offset = h * d_k;
                     let q_raw_head = &q_raw[t * d + h_offset..t * d + h_offset + d_k];
                     let k_raw_head = &k_raw[t * d + h_offset..t * d + h_offset + d_k];
@@ -971,8 +1034,8 @@ impl TesseraModel {
                     let dq_r = &mut dq_rope[t * d + h_offset..t * d + h_offset + d_k];
                     let dk_r = &mut dk_rope[t * d + h_offset..t * d + h_offset + d_k];
 
-                    rms_norm_head_backward(q_raw_head, q_rms[t * n_heads + h], dq_head, dq_r);
-                    rms_norm_head_backward(k_raw_head, k_rms[t * n_heads + h], dk_head, dk_r);
+                    rms_norm_head_backward(q_raw_head, q_rms[t * n_subheads + h], dq_head, dq_r);
+                    rms_norm_head_backward(k_raw_head, k_rms[t * n_subheads + h], dk_head, dk_r);
                 }
             }
 
@@ -980,7 +1043,7 @@ impl TesseraModel {
             let mut dq_mat = vec![0.0f32; t_len * d];
             let mut dk_mat = vec![0.0f32; t_len * d];
             for t in 0..t_len {
-                for h in 0..n_heads {
+                for h in 0..n_subheads {
                     let h_offset = h * d_k;
                     apply_rope_backward(
                         &dq_rope[t * d + h_offset..t * d + h_offset + d_k],
@@ -1001,6 +1064,9 @@ impl TesseraModel {
             let wq_v = MatrixView::new(&stage.wq, d, d);
             let wk_v = MatrixView::new(&stage.wk, d, d);
             let wv_v = MatrixView::new(&stage.wv, d, d);
+            let mut gwq = MatrixViewMut::new(&mut s_grads.grad_wq, d, d);
+            let mut gwk = MatrixViewMut::new(&mut s_grads.grad_wk, d, d);
+            let mut gwv = MatrixViewMut::new(&mut s_grads.grad_wv, d, d);
 
             for t in 0..t_len {
                 let ht_conv = &h_conv[t * d..(t + 1) * d];

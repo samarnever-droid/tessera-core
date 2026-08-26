@@ -13,6 +13,7 @@ pub struct StageMoments {
     pub m_n1: Vec<f32>, pub v_n1: Vec<f32>,
     pub m_conv: Vec<f32>, pub v_conv: Vec<f32>,
     pub m_gate_attn: Vec<f32>, pub v_gate_attn: Vec<f32>,
+    pub m_lambda: Vec<f32>, pub v_lambda: Vec<f32>,
     pub m_wq: Vec<f32>, pub v_wq: Vec<f32>,
     pub m_wk: Vec<f32>, pub v_wk: Vec<f32>,
     pub m_wv: Vec<f32>, pub v_wv: Vec<f32>,
@@ -31,6 +32,7 @@ impl StageMoments {
             m_n1: vec![0.0f32; d], v_n1: vec![0.0f32; d],
             m_conv: vec![0.0f32; 4 * d], v_conv: vec![0.0f32; 4 * d],
             m_gate_attn: vec![0.0f32; d * d], v_gate_attn: vec![0.0f32; d * d],
+            m_lambda: vec![0.0f32; 2], v_lambda: vec![0.0f32; 2],
             m_wq: vec![0.0f32; d * d], v_wq: vec![0.0f32; d * d],
             m_wk: vec![0.0f32; d * d], v_wk: vec![0.0f32; d * d],
             m_wv: vec![0.0f32; d * d], v_wv: vec![0.0f32; d * d],
@@ -88,6 +90,7 @@ impl TesseraAdamW {
             for &g in &sg.grad_norm1_gamma { sum_sq += g * g; }
             for &g in &sg.grad_w_conv { sum_sq += g * g; }
             for &g in &sg.grad_w_gate_attn { sum_sq += g * g; }
+            for &g in &sg.grad_lambda_diff { sum_sq += g * g; }
             for &g in &sg.grad_wq { sum_sq += g * g; }
             for &g in &sg.grad_wk { sum_sq += g * g; }
             for &g in &sg.grad_wv { sum_sq += g * g; }
@@ -144,6 +147,7 @@ impl TesseraAdamW {
             update_p(&mut stage.norm1_gamma, &s_grads.grad_norm1_gamma, &mut sm.m_n1, &mut sm.v_n1);
             update_p(&mut stage.w_conv, &s_grads.grad_w_conv, &mut sm.m_conv, &mut sm.v_conv);
             update_p(&mut stage.w_gate_attn, &s_grads.grad_w_gate_attn, &mut sm.m_gate_attn, &mut sm.v_gate_attn);
+            update_p(&mut stage.lambda_diff, &s_grads.grad_lambda_diff, &mut sm.m_lambda, &mut sm.v_lambda);
             update_p(&mut stage.wq, &s_grads.grad_wq, &mut sm.m_wq, &mut sm.v_wq);
             update_p(&mut stage.wk, &s_grads.grad_wk, &mut sm.m_wk, &mut sm.v_wk);
             update_p(&mut stage.wv, &s_grads.grad_wv, &mut sm.m_wv, &mut sm.v_wv);
@@ -272,6 +276,7 @@ pub fn train_tessera(
             axiom_core::tensor::vec_scale(&mut sg.grad_norm1_gamma, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_w_conv, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_w_gate_attn, scale);
+            axiom_core::tensor::vec_scale(&mut sg.grad_lambda_diff, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_wq, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_wk, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_wv, scale);
