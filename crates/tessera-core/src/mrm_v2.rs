@@ -1,9 +1,12 @@
-//! Multi-Resolution Working Memory v2 (MRM-v2) for TESSERA.
+//! Multi-Resolution Working Memory v2 (MRM) for TESSERA.
 //! Features:
-//! 1. Content-based Least-Recently-Queried (LRQ) and Salience eviction with in-place deduplication.
+//! 1. Multi-Tier Adaptive Write Engine:
+//!    - Hard Overwrite (sim >= 0.95)
+//!    - Soft Semantic Merge & Temporal Drift Tracking (0.82 <= sim < 0.95)
+//!    - Salience-Weighted LRQ Eviction (sim < 0.82)
 //! 2. Dual-Resolution storage: K_fine exact token slots + K_coarse EMA summary centroids.
 //! 3. Sharp Cosine Temperature Softmax (tau = 0.05) for high-precision needle discrimination.
-//! 4. Low-rank gated modulation: dense trunk dynamically gates memory reads.
+//! 4. Graceful Overflow Fallback: Coarse centroids preserve semantic summaries when M > K_fine.
 
 use axiom_core::matvec::{matvec, matvec_transposed, outer_product_accumulate};
 use axiom_core::softmax::softmax;
@@ -69,7 +72,7 @@ impl MrmV2Grads {
     }
 }
 
-/// Multi-Resolution Memory v2 with LRQ Eviction Policy & Cosine Temperature Retrieval.
+/// Multi-Resolution Memory (MRM) with Adaptive Multi-Tier Deduplication & LRQ Eviction Policy.
 #[derive(Debug, Clone)]
 pub struct MultiResMemoryV2 {
     pub d: usize,
@@ -139,60 +142,84 @@ impl MultiResMemoryV2 {
         (self.k_fine * self.d * 2 + self.k_coarse * self.d * 2 + self.k_fine * 2) * 4
     }
 
-    /// Insert / write an item into memory using Least-Recently-Queried (LRQ) eviction and in-place deduplication.
+    /// Insert / write an item into memory using the Adaptive Multi-Tier Engine:
+    /// - Tier 1: Hard In-Place Overwrite (sim >= 0.95)
+    /// - Tier 2: Soft Semantic Merge (0.82 <= sim < 0.95) for incremental drift tracking
+    /// - Tier 3: Salience-Weighted LRQ Eviction (sim < 0.82)
     pub fn write_token(&mut self, key_vec: &[f32], val_vec: &[f32], salience: f32) {
         let d = self.d;
         let k_fine = self.k_fine;
 
-        // 1. In-place Deduplication: Check if an existing slot matches this key (Temporal Overwrite)
+        // 1. Scan fine slots for semantic correlation
         let key_norm = dot(key_vec, key_vec).sqrt().max(1e-8);
-        let mut match_slot = None;
+        let mut best_sim = f32::NEG_INFINITY;
+        let mut best_sim_slot = None;
 
         for i in 0..self.num_occupied_slots {
             let k_slice = &self.fine_keys[i * d..(i + 1) * d];
             let k_norm = dot(k_slice, k_slice).sqrt().max(1e-8);
             let sim = dot(key_vec, k_slice) / (key_norm * k_norm);
-            if sim >= 0.95 {
-                match_slot = Some(i);
-                break;
+            if sim > best_sim {
+                best_sim = sim;
+                best_sim_slot = Some(i);
             }
         }
 
-        let slot_idx = if let Some(existing) = match_slot {
-            existing
-        } else if self.num_occupied_slots < k_fine {
-            let idx = self.num_occupied_slots;
-            self.num_occupied_slots += 1;
-            idx
-        } else {
-            // Find slot with minimum utility (hits * 2.0 + salience)
-            let mut min_util = f32::INFINITY;
-            let mut best_idx = 0usize;
-            for i in 0..k_fine {
-                let util = self.fine_hits[i] * 2.0 + self.fine_salience[i];
-                if util < min_util {
-                    min_util = util;
-                    best_idx = i;
-                }
+        // 2. Multi-Tier Resolution
+        if best_sim >= 0.95 {
+            // Tier 1: Hard In-Place Overwrite (Identical Entity Update)
+            let slot_idx = best_sim_slot.unwrap();
+            self.fine_keys[slot_idx * d..(slot_idx + 1) * d].copy_from_slice(key_vec);
+            self.fine_vals[slot_idx * d..(slot_idx + 1) * d].copy_from_slice(val_vec);
+            self.fine_salience[slot_idx] = salience.max(self.fine_salience[slot_idx]);
+            self.fine_hits[slot_idx] = (self.fine_hits[slot_idx] + 1.0).min(50.0);
+        } else if best_sim >= 0.82 {
+            // Tier 2: Soft Semantic Merge (Incremental Drift Tracking)
+            let slot_idx = best_sim_slot.unwrap();
+            let alpha = 0.70f32;
+            let k_slice = &mut self.fine_keys[slot_idx * d..(slot_idx + 1) * d];
+            let v_slice = &mut self.fine_vals[slot_idx * d..(slot_idx + 1) * d];
+            for c in 0..d {
+                k_slice[c] = alpha * key_vec[c] + (1.0 - alpha) * k_slice[c];
+                v_slice[c] = alpha * val_vec[c] + (1.0 - alpha) * v_slice[c];
             }
-            best_idx
-        };
+            self.fine_salience[slot_idx] = salience.max(self.fine_salience[slot_idx]);
+            self.fine_hits[slot_idx] = (self.fine_hits[slot_idx] + 0.5).min(50.0);
+        } else {
+            // Tier 3: New Entity Insertion / LRQ Eviction
+            let slot_idx = if self.num_occupied_slots < k_fine {
+                let idx = self.num_occupied_slots;
+                self.num_occupied_slots += 1;
+                idx
+            } else {
+                // Find slot with minimum utility (hits * 2.0 + salience)
+                let mut min_util = f32::INFINITY;
+                let mut victim_idx = 0usize;
+                for i in 0..k_fine {
+                    let util = self.fine_hits[i] * 2.0 + self.fine_salience[i];
+                    if util < min_util {
+                        min_util = util;
+                        victim_idx = i;
+                    }
+                }
+                victim_idx
+            };
 
-        // Write to fine slot
-        self.fine_keys[slot_idx * d..(slot_idx + 1) * d].copy_from_slice(key_vec);
-        self.fine_vals[slot_idx * d..(slot_idx + 1) * d].copy_from_slice(val_vec);
-        self.fine_salience[slot_idx] = salience;
-        self.fine_hits[slot_idx] = 1.0f32; // Fresh slot starts with baseline hit
+            self.fine_keys[slot_idx * d..(slot_idx + 1) * d].copy_from_slice(key_vec);
+            self.fine_vals[slot_idx * d..(slot_idx + 1) * d].copy_from_slice(val_vec);
+            self.fine_salience[slot_idx] = salience;
+            self.fine_hits[slot_idx] = 1.0f32;
+        }
 
-        // Update coarse centroid via EMA
+        // 3. Update coarse centroid via EMA summary
         let mut best_centroid = 0usize;
-        let mut max_sim = f32::NEG_INFINITY;
+        let mut max_c_sim = f32::NEG_INFINITY;
         for c in 0..self.k_coarse {
             let centroid = &self.coarse_centroids[c * d..(c + 1) * d];
             let c_norm = dot(centroid, centroid).sqrt().max(1e-8);
             let sim = dot(key_vec, centroid) / (key_norm * c_norm);
-            if sim > max_sim {
-                max_sim = sim;
+            if sim > max_c_sim {
+                max_c_sim = sim;
                 best_centroid = c;
             }
         }
@@ -208,7 +235,7 @@ impl MultiResMemoryV2 {
         self.stats.total_writes += 1;
     }
 
-    /// Read from MRM-v2 using query vector Q with sharp Cosine Temperature Softmax (tau = 0.05).
+    /// Read from MRM using query vector Q with sharp Cosine Temperature Softmax (tau = 0.05).
     pub fn read_memory(&mut self, query_vec: &[f32], out_context: &mut [f32]) {
         let d = self.d;
         let k_fine = self.num_occupied_slots.max(1);
