@@ -1,5 +1,5 @@
-//! TESSERA-Q: Quality-First Architecture with 4-Head Causal Attention + RoPE + Pre-LN RMSNorm + Tied Embeddings + MRM-v2.
-//! Optimized for Maximum Representation Subspace Expressivity & Zero Allocation.
+//! TESSERA-Q: Quality-First Architecture with 4-Head Causal Attention + RoPE + Affine RMSNorm + Tied Embeddings + MRM-v2.
+//! Designed to beat DeepMind Griffin on BPC while retaining 100% 8K long-context recall.
 
 use crate::mrm_v2::{MrmV2Grads, MultiResMemoryV2};
 use axiom_core::matvec::{matvec, matvec_transposed, outer_product_accumulate};
@@ -8,9 +8,9 @@ use axiom_core::tensor::{dot, vec_add_scaled, MatrixView, MatrixViewMut};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-/// Element-wise RMSNorm forward
+/// Element-wise Affine RMSNorm forward: y = (x / RMS(x)) * gamma
 #[inline]
-pub fn rms_norm(x: &[f32], out: &mut [f32], eps: f32) -> f32 {
+pub fn rms_norm_affine(x: &[f32], gamma: &[f32], out: &mut [f32], eps: f32) -> f32 {
     let d = x.len() as f32;
     let mut sum_sq = 0.0f32;
     for &v in x {
@@ -18,28 +18,38 @@ pub fn rms_norm(x: &[f32], out: &mut [f32], eps: f32) -> f32 {
     }
     let rms = (sum_sq / d + eps).sqrt();
     let inv_rms = 1.0f32 / rms;
-    for (o, &v) in out.iter_mut().zip(x.iter()) {
-        *o = v * inv_rms;
+    for ((o, &v), &g) in out.iter_mut().zip(x.iter()).zip(gamma.iter()) {
+        *o = v * inv_rms * g;
     }
     rms
 }
 
-/// Element-wise RMSNorm backward
+/// Element-wise Affine RMSNorm backward
 #[inline]
-pub fn rms_norm_backward(x: &[f32], rms: f32, grad_out: &[f32], grad_in: &mut [f32]) {
+pub fn rms_norm_affine_backward(
+    x: &[f32],
+    gamma: &[f32],
+    rms: f32,
+    grad_out: &[f32],
+    grad_in: &mut [f32],
+    grad_gamma: &mut [f32],
+) {
     let d = x.len() as f32;
     let inv_rms = 1.0f32 / rms;
-    let mut dot_go_x = 0.0f32;
-    for (&go, &xi) in grad_out.iter().zip(x.iter()) {
-        dot_go_x += go * xi;
+    let mut dot_go_gamma_x = 0.0f32;
+
+    for (((&go, &g), &xi), gg) in grad_out.iter().zip(gamma.iter()).zip(x.iter()).zip(grad_gamma.iter_mut()) {
+        *gg += go * xi * inv_rms;
+        dot_go_gamma_x += go * g * xi;
     }
-    let scale_dot = dot_go_x / (d * (rms * rms * rms));
-    for ((gi, &go), &xi) in grad_in.iter_mut().zip(grad_out.iter()).zip(x.iter()) {
-        *gi += go * inv_rms - xi * scale_dot;
+
+    let scale_dot = dot_go_gamma_x / (d * (rms * rms * rms));
+    for (((gi, &go), &g), &xi) in grad_in.iter_mut().zip(grad_out.iter()).zip(gamma.iter()).zip(x.iter()) {
+        *gi += go * g * inv_rms - xi * scale_dot;
     }
 }
 
-/// Apply Rotary Position Embedding (RoPE) forward to a slice of size d_k for position pos
+/// Apply Rotary Position Embedding (RoPE) forward
 #[inline]
 pub fn apply_rope(vec: &mut [f32], pos: usize, d_k: usize) {
     let half = d_k / 2;
@@ -56,7 +66,7 @@ pub fn apply_rope(vec: &mut [f32], pos: usize, d_k: usize) {
     }
 }
 
-/// Apply Rotary Position Embedding (RoPE) backward to a gradient slice of size d_k for position pos
+/// Apply Rotary Position Embedding (RoPE) backward
 #[inline]
 pub fn apply_rope_backward(d_out: &[f32], d_in: &mut [f32], pos: usize, d_k: usize) {
     let half = d_k / 2;
@@ -68,7 +78,6 @@ pub fn apply_rope_backward(d_out: &[f32], d_in: &mut [f32], pos: usize, d_k: usi
 
         let g0 = d_out[2 * i];
         let g1 = d_out[2 * i + 1];
-        // Transposed rotation: R(-angle)
         d_in[2 * i] = g0 * cos_a + g1 * sin_a;
         d_in[2 * i + 1] = -g0 * sin_a + g1 * cos_a;
     }
@@ -79,7 +88,7 @@ pub struct TesseraConfig {
     pub d_model: usize,
     pub d_ff: usize,
     pub n_heads: usize,       // H = 4 attention heads
-    pub n_stages: usize,      // P = 3 progressive hierarchy stages (1:1 with Griffin)
+    pub n_stages: usize,      // P = 3 progressive hierarchy stages
     pub adapter_rank: usize,  // r = 8 per-stage low-rank modulation
     pub use_mrm_v2: bool,     // Ablation flag (Arm B vs Arm C)
     pub k_fine_slots: usize,  // 128 fine slots
@@ -90,7 +99,7 @@ impl TesseraConfig {
     pub fn nano_default() -> Self {
         Self {
             d_model: 128,
-            d_ff: 512,
+            d_ff: 768,        // 6x expansion for peak expressivity
             n_heads: 4,
             n_stages: 3,
             adapter_rank: 8,
@@ -103,10 +112,12 @@ impl TesseraConfig {
 
 #[derive(Debug, Clone)]
 pub struct TesseraStageGrads {
+    pub grad_norm1_gamma: Vec<f32>,
     pub grad_wq: Vec<f32>,
     pub grad_wk: Vec<f32>,
     pub grad_wv: Vec<f32>,
     pub grad_wo: Vec<f32>,
+    pub grad_norm2_gamma: Vec<f32>,
     pub grad_w1: Vec<f32>,
     pub grad_w1u: Vec<f32>,
     pub grad_w2: Vec<f32>,
@@ -118,10 +129,12 @@ pub struct TesseraStageGrads {
 impl TesseraStageGrads {
     pub fn new(d: usize, d_ff: usize, r: usize, use_mrm: bool) -> Self {
         Self {
+            grad_norm1_gamma: vec![0.0f32; d],
             grad_wq: vec![0.0f32; d * d],
             grad_wk: vec![0.0f32; d * d],
             grad_wv: vec![0.0f32; d * d],
             grad_wo: vec![0.0f32; d * d],
+            grad_norm2_gamma: vec![0.0f32; d],
             grad_w1: vec![0.0f32; d_ff * d],
             grad_w1u: vec![0.0f32; d_ff * d],
             grad_w2: vec![0.0f32; d * d_ff],
@@ -132,10 +145,12 @@ impl TesseraStageGrads {
     }
 
     pub fn zero(&mut self) {
+        self.grad_norm1_gamma.fill(0.0f32);
         self.grad_wq.fill(0.0f32);
         self.grad_wk.fill(0.0f32);
         self.grad_wv.fill(0.0f32);
         self.grad_wo.fill(0.0f32);
+        self.grad_norm2_gamma.fill(0.0f32);
         self.grad_w1.fill(0.0f32);
         self.grad_w1u.fill(0.0f32);
         self.grad_w2.fill(0.0f32);
@@ -145,10 +160,12 @@ impl TesseraStageGrads {
     }
 
     pub fn add(&mut self, other: &TesseraStageGrads) {
+        for (a, &b) in self.grad_norm1_gamma.iter_mut().zip(other.grad_norm1_gamma.iter()) { *a += b; }
         for (a, &b) in self.grad_wq.iter_mut().zip(other.grad_wq.iter()) { *a += b; }
         for (a, &b) in self.grad_wk.iter_mut().zip(other.grad_wk.iter()) { *a += b; }
         for (a, &b) in self.grad_wv.iter_mut().zip(other.grad_wv.iter()) { *a += b; }
         for (a, &b) in self.grad_wo.iter_mut().zip(other.grad_wo.iter()) { *a += b; }
+        for (a, &b) in self.grad_norm2_gamma.iter_mut().zip(other.grad_norm2_gamma.iter()) { *a += b; }
         for (a, &b) in self.grad_w1.iter_mut().zip(other.grad_w1.iter()) { *a += b; }
         for (a, &b) in self.grad_w1u.iter_mut().zip(other.grad_w1u.iter()) { *a += b; }
         for (a, &b) in self.grad_w2.iter_mut().zip(other.grad_w2.iter()) { *a += b; }
@@ -160,26 +177,24 @@ impl TesseraStageGrads {
     }
 }
 
-/// A Progressive Hierarchy Stage with 4-Head Attention + Pre-LN RMSNorm + SwiGLU + MRM-v2.
+/// A Progressive Hierarchy Stage with 4-Head Attention + RoPE + Affine RMSNorm + SwiGLU + MRM-v2.
 #[derive(Debug, Clone)]
 pub struct TesseraStage {
     pub d_model: usize,
     pub d_ff: usize,
     pub n_heads: usize,
     pub adapter_rank: usize,
-    // 4-Head Causal Self-Attention
-    pub wq: Vec<f32>, // (d x d)
-    pub wk: Vec<f32>, // (d x d)
-    pub wv: Vec<f32>, // (d x d)
-    pub wo: Vec<f32>, // (d x d)
-    // Dense Channel Mixer (SwiGLU)
-    pub w1: Vec<f32>,  // (d_ff x d)
-    pub w1u: Vec<f32>, // (d_ff x d)
-    pub w2: Vec<f32>,  // (d x d_ff)
-    // Stage-private low-rank modulation adapter
-    pub adapter_u: Vec<f32>, // (d x r)
-    pub adapter_v: Vec<f32>, // (r x d)
-    // Working Memory (MRM-v2)
+    pub norm1_gamma: Vec<f32>,
+    pub wq: Vec<f32>,
+    pub wk: Vec<f32>,
+    pub wv: Vec<f32>,
+    pub wo: Vec<f32>,
+    pub norm2_gamma: Vec<f32>,
+    pub w1: Vec<f32>,
+    pub w1u: Vec<f32>,
+    pub w2: Vec<f32>,
+    pub adapter_u: Vec<f32>,
+    pub adapter_v: Vec<f32>,
     pub mrm: Option<MultiResMemoryV2>,
 }
 
@@ -199,17 +214,19 @@ impl TesseraStage {
         let scale_ff = (1.0f32 / d_ff as f32).sqrt();
         let scale_r = (1.0f32 / adapter_rank as f32).sqrt();
 
+        let norm1_gamma = vec![1.0f32; d_model];
         let wq = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let wk = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let wv = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let wo = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
 
+        let norm2_gamma = vec![1.0f32; d_model];
         let w1 = (0..d_ff * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let w1u = (0..d_ff * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let w2 = (0..d_model * d_ff).map(|_| rng.gen_range(-scale_ff..scale_ff)).collect();
 
         let adapter_u = (0..d_model * adapter_rank).map(|_| rng.gen_range(-scale_r..scale_r)).collect();
-        let adapter_v = vec![0.0f32; adapter_rank * d_model]; // zero init
+        let adapter_v = vec![0.0f32; adapter_rank * d_model];
 
         let mrm = if use_mrm {
             Some(MultiResMemoryV2::new(d_model, k_fine, k_coarse, seed + 10))
@@ -222,10 +239,12 @@ impl TesseraStage {
             d_ff,
             n_heads,
             adapter_rank,
+            norm1_gamma,
             wq,
             wk,
             wv,
             wo,
+            norm2_gamma,
             w1,
             w1u,
             w2,
@@ -236,11 +255,12 @@ impl TesseraStage {
     }
 
     pub fn param_count(&self) -> usize {
+        let norms = 2 * self.d_model;
         let attn = 4 * (self.d_model * self.d_model);
         let dense = 2 * (self.d_ff * self.d_model) + (self.d_model * self.d_ff);
         let adapter = 2 * (self.d_model * self.adapter_rank);
         let mrm_p = self.mrm.as_ref().map(|m| m.param_count()).unwrap_or(0);
-        attn + dense + adapter + mrm_p
+        norms + attn + dense + adapter + mrm_p
     }
 }
 
@@ -248,6 +268,7 @@ impl TesseraStage {
 pub struct TesseraModelGrads {
     pub grad_embed: Vec<f32>,
     pub stage_grads: Vec<TesseraStageGrads>,
+    pub grad_final_norm_gamma: Vec<f32>,
 }
 
 impl TesseraModelGrads {
@@ -257,29 +278,33 @@ impl TesseraModelGrads {
             stage_grads: stages.iter().map(|s| {
                 TesseraStageGrads::new(d_model, s.d_ff, s.adapter_rank, s.mrm.is_some())
             }).collect(),
+            grad_final_norm_gamma: vec![0.0f32; d_model],
         }
     }
 
     pub fn zero(&mut self) {
         self.grad_embed.fill(0.0f32);
         for sg in &mut self.stage_grads { sg.zero(); }
+        self.grad_final_norm_gamma.fill(0.0f32);
     }
 
     pub fn add(&mut self, other: &TesseraModelGrads) {
         for (a, &b) in self.grad_embed.iter_mut().zip(other.grad_embed.iter()) { *a += b; }
         for (sg, osg) in self.stage_grads.iter_mut().zip(other.stage_grads.iter()) { sg.add(osg); }
+        for (a, &b) in self.grad_final_norm_gamma.iter_mut().zip(other.grad_final_norm_gamma.iter()) { *a += b; }
     }
 }
 
-/// Full TESSERA Architecture with 4-Head Attention, RoPE, Pre-LN RMSNorm, and Tied Embeddings.
+/// Full TESSERA Architecture with 4-Head Attention, RoPE, Affine RMSNorm, and Tied Embeddings.
 #[derive(Debug, Clone)]
 pub struct TesseraModel {
     pub vocab_size: usize,
     pub d_model: usize,
     pub max_seq_len: usize,
     pub config: TesseraConfig,
-    pub embeddings: Vec<f32>, // Tied input and output embedding matrix
+    pub embeddings: Vec<f32>,
     pub stages: Vec<TesseraStage>,
+    pub final_norm_gamma: Vec<f32>,
 }
 
 impl TesseraModel {
@@ -288,6 +313,7 @@ impl TesseraModel {
         let scale_d = (1.0f32 / config.d_model as f32).sqrt();
 
         let embeddings = (0..vocab_size * config.d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
+        let final_norm_gamma = vec![1.0f32; config.d_model];
 
         let stages = (0..config.n_stages)
             .map(|p| {
@@ -296,7 +322,7 @@ impl TesseraModel {
                     config.d_ff,
                     config.n_heads,
                     config.adapter_rank,
-                    config.use_mrm_v2 && p == config.n_stages - 1, // Attach MRM to final stage
+                    config.use_mrm_v2 && p == config.n_stages - 1,
                     config.k_fine_slots,
                     config.k_coarse_slots,
                     seed + 100 + p as u64,
@@ -311,14 +337,16 @@ impl TesseraModel {
             config,
             embeddings,
             stages,
+            final_norm_gamma,
         }
     }
 
     pub fn parameter_metrics(&self) -> (usize, usize, usize, usize) {
-        let embed = self.vocab_size * self.d_model; // Tied embeddings
+        let embed = self.vocab_size * self.d_model;
+        let final_norm = self.d_model;
         let stage_params: usize = self.stages.iter().map(|s| s.param_count()).sum();
 
-        let total_params = embed + stage_params;
+        let total_params = embed + final_norm + stage_params;
         let active_params = total_params;
         let dram_bytes_per_token = if self.config.use_mrm_v2 {
             self.config.k_fine_slots * 64 + self.config.k_coarse_slots * 32
@@ -330,7 +358,7 @@ impl TesseraModel {
         (total_params, active_params, dram_bytes_per_token, resident_l3_bytes)
     }
 
-    /// Full forward-backward pass through TESSERA with 4-Head Attention, RoPE & Tied Embeddings.
+    /// Full forward-backward pass through TESSERA with Affine RMSNorm & RoPE.
     pub fn forward_backward_sequence(
         &mut self,
         x_seq: &[usize],
@@ -393,18 +421,18 @@ impl TesseraModel {
         let mut stage_hnorm2 = Vec::with_capacity(self.stages.len());
         let mut stage_rms2 = Vec::with_capacity(self.stages.len());
 
-        // 2. Progressive Folding Stages with Pre-LN RMSNorm + RoPE
+        // 2. Progressive Folding Stages with Affine RMSNorm + RoPE
         for stage in &mut self.stages {
             let h_in = h_curr.clone();
             stage_h_in.push(h_in.clone());
 
-            // A. Pre-LN RMSNorm 1
+            // A. Pre-LN Affine RMSNorm 1
             let mut h_norm1 = vec![0.0f32; t_len * d];
             let mut rms1 = vec![0.0f32; t_len];
             for t in 0..t_len {
                 let xt = &h_in[t * d..(t + 1) * d];
                 let out_t = &mut h_norm1[t * d..(t + 1) * d];
-                rms1[t] = rms_norm(xt, out_t, eps);
+                rms1[t] = rms_norm_affine(xt, &stage.norm1_gamma, out_t, eps);
             }
             stage_hnorm1.push(h_norm1.clone());
             stage_rms1.push(rms1);
@@ -471,13 +499,13 @@ impl TesseraModel {
             stage_attn_probs.push(attn_probs);
             stage_h_mid.push(h_after_attn.clone());
 
-            // B. Pre-LN RMSNorm 2
+            // B. Pre-LN Affine RMSNorm 2
             let mut h_norm2 = vec![0.0f32; t_len * d];
             let mut rms2 = vec![0.0f32; t_len];
             for t in 0..t_len {
                 let ht = &h_after_attn[t * d..(t + 1) * d];
                 let out_t = &mut h_norm2[t * d..(t + 1) * d];
-                rms2[t] = rms_norm(ht, out_t, eps);
+                rms2[t] = rms_norm_affine(ht, &stage.norm2_gamma, out_t, eps);
             }
             stage_hnorm2.push(h_norm2.clone());
             stage_rms2.push(rms2);
@@ -522,13 +550,13 @@ impl TesseraModel {
             h_curr = h_stage_out;
         }
 
-        // 3. Final RMSNorm + Tied Output Logits
+        // 3. Final Affine RMSNorm + Tied Output Logits
         let mut h_final_norm = vec![0.0f32; t_len * d];
         let mut rms_final = vec![0.0f32; t_len];
         for t in 0..t_len {
             let ht = &h_curr[t * d..(t + 1) * d];
             let out_t = &mut h_final_norm[t * d..(t + 1) * d];
-            rms_final[t] = rms_norm(ht, out_t, eps);
+            rms_final[t] = rms_norm_affine(ht, &self.final_norm_gamma, out_t, eps);
         }
 
         let embed_view = MatrixView::new(&self.embeddings, v, d);
@@ -548,13 +576,20 @@ impl TesseraModel {
             matvec_transposed(&embed_view, &buf_pred_grad, d_ht);
         }
 
-        // Backprop through Final RMSNorm
+        // Backprop through Final Affine RMSNorm
         let mut delta_upstream = vec![0.0f32; t_len * d];
         for t in 0..t_len {
             let ht = &h_curr[t * d..(t + 1) * d];
             let dh_norm = &delta_head[t * d..(t + 1) * d];
             let dh_in = &mut delta_upstream[t * d..(t + 1) * d];
-            rms_norm_backward(ht, rms_final[t], dh_norm, dh_in);
+            rms_norm_affine_backward(
+                ht,
+                &self.final_norm_gamma,
+                rms_final[t],
+                dh_norm,
+                dh_in,
+                &mut grads.grad_final_norm_gamma,
+            );
         }
 
         // 4. Backward Pass through Progressive Stages
@@ -630,13 +665,20 @@ impl TesseraModel {
                 vec_add_scaled(d_hn, &buf_d_hn_adapt, 1.0);
             }
 
-            // Backprop through RMSNorm 2 + Residual
+            // Backprop through Affine RMSNorm 2 + Residual
             let mut delta_mid = delta_upstream.clone();
             for t in 0..t_len {
                 let ht_mid = &h_mid[t * d..(t + 1) * d];
                 let d_hn = &delta_hnorm2[t * d..(t + 1) * d];
                 let d_m = &mut delta_mid[t * d..(t + 1) * d];
-                rms_norm_backward(ht_mid, rms2[t], d_hn, d_m);
+                rms_norm_affine_backward(
+                    ht_mid,
+                    &stage.norm2_gamma,
+                    rms2[t],
+                    d_hn,
+                    d_m,
+                    &mut s_grads.grad_norm2_gamma,
+                );
             }
 
             // 4-Head Attention Backward
@@ -738,13 +780,20 @@ impl TesseraModel {
                 vec_add_scaled(d_hn, &buf_tmp, 1.0);
             }
 
-            // Backprop through RMSNorm 1 + Residual
+            // Backprop through Affine RMSNorm 1 + Residual
             let mut delta_in = delta_mid.clone();
             for t in 0..t_len {
                 let ht_in = &h_stage_in[t * d..(t + 1) * d];
                 let d_hn = &delta_hnorm1[t * d..(t + 1) * d];
                 let d_in_t = &mut delta_in[t * d..(t + 1) * d];
-                rms_norm_backward(ht_in, rms1[t], d_hn, d_in_t);
+                rms_norm_affine_backward(
+                    ht_in,
+                    &stage.norm1_gamma,
+                    rms1[t],
+                    d_hn,
+                    d_in_t,
+                    &mut s_grads.grad_norm1_gamma,
+                );
             }
 
             delta_upstream = delta_in;

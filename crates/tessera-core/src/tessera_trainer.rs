@@ -9,10 +9,12 @@ use std::time::Instant;
 
 #[derive(Debug, Clone)]
 pub struct StageMoments {
+    pub m_n1: Vec<f32>, pub v_n1: Vec<f32>,
     pub m_wq: Vec<f32>, pub v_wq: Vec<f32>,
     pub m_wk: Vec<f32>, pub v_wk: Vec<f32>,
     pub m_wv: Vec<f32>, pub v_wv: Vec<f32>,
     pub m_wo: Vec<f32>, pub v_wo: Vec<f32>,
+    pub m_n2: Vec<f32>, pub v_n2: Vec<f32>,
     pub m_w1: Vec<f32>, pub v_w1: Vec<f32>,
     pub m_w1u: Vec<f32>, pub v_w1u: Vec<f32>,
     pub m_w2: Vec<f32>, pub v_w2: Vec<f32>,
@@ -23,10 +25,12 @@ pub struct StageMoments {
 impl StageMoments {
     pub fn new(d: usize, d_ff: usize, r: usize) -> Self {
         Self {
+            m_n1: vec![0.0f32; d], v_n1: vec![0.0f32; d],
             m_wq: vec![0.0f32; d * d], v_wq: vec![0.0f32; d * d],
             m_wk: vec![0.0f32; d * d], v_wk: vec![0.0f32; d * d],
             m_wv: vec![0.0f32; d * d], v_wv: vec![0.0f32; d * d],
             m_wo: vec![0.0f32; d * d], v_wo: vec![0.0f32; d * d],
+            m_n2: vec![0.0f32; d], v_n2: vec![0.0f32; d],
             m_w1: vec![0.0f32; d_ff * d], v_w1: vec![0.0f32; d_ff * d],
             m_w1u: vec![0.0f32; d_ff * d], v_w1u: vec![0.0f32; d_ff * d],
             m_w2: vec![0.0f32; d * d_ff], v_w2: vec![0.0f32; d * d_ff],
@@ -45,6 +49,7 @@ pub struct TesseraAdamW {
     pub max_grad_norm: f32,
     pub step: usize,
     pub m_embed: Vec<f32>, pub v_embed: Vec<f32>,
+    pub m_final_norm: Vec<f32>, pub v_final_norm: Vec<f32>,
     pub stage_moments: Vec<StageMoments>,
 }
 
@@ -64,6 +69,8 @@ impl TesseraAdamW {
             step: 0,
             m_embed: vec![0.0f32; model.embeddings.len()],
             v_embed: vec![0.0f32; model.embeddings.len()],
+            m_final_norm: vec![0.0f32; model.final_norm_gamma.len()],
+            v_final_norm: vec![0.0f32; model.final_norm_gamma.len()],
             stage_moments,
         }
     }
@@ -71,11 +78,14 @@ impl TesseraAdamW {
     pub fn compute_grad_norm(&self, grads: &TesseraModelGrads) -> f32 {
         let mut sum_sq = 0.0f32;
         for &g in &grads.grad_embed { sum_sq += g * g; }
+        for &g in &grads.grad_final_norm_gamma { sum_sq += g * g; }
         for sg in &grads.stage_grads {
+            for &g in &sg.grad_norm1_gamma { sum_sq += g * g; }
             for &g in &sg.grad_wq { sum_sq += g * g; }
             for &g in &sg.grad_wk { sum_sq += g * g; }
             for &g in &sg.grad_wv { sum_sq += g * g; }
             for &g in &sg.grad_wo { sum_sq += g * g; }
+            for &g in &sg.grad_norm2_gamma { sum_sq += g * g; }
             for &g in &sg.grad_w1 { sum_sq += g * g; }
             for &g in &sg.grad_w1u { sum_sq += g * g; }
             for &g in &sg.grad_w2 { sum_sq += g * g; }
@@ -121,12 +131,15 @@ impl TesseraAdamW {
         };
 
         update_p(&mut model.embeddings, &grads.grad_embed, &mut self.m_embed, &mut self.v_embed);
+        update_p(&mut model.final_norm_gamma, &grads.grad_final_norm_gamma, &mut self.m_final_norm, &mut self.v_final_norm);
 
         for ((stage, s_grads), sm) in model.stages.iter_mut().zip(grads.stage_grads.iter_mut()).zip(self.stage_moments.iter_mut()) {
+            update_p(&mut stage.norm1_gamma, &s_grads.grad_norm1_gamma, &mut sm.m_n1, &mut sm.v_n1);
             update_p(&mut stage.wq, &s_grads.grad_wq, &mut sm.m_wq, &mut sm.v_wq);
             update_p(&mut stage.wk, &s_grads.grad_wk, &mut sm.m_wk, &mut sm.v_wk);
             update_p(&mut stage.wv, &s_grads.grad_wv, &mut sm.m_wv, &mut sm.v_wv);
             update_p(&mut stage.wo, &s_grads.grad_wo, &mut sm.m_wo, &mut sm.v_wo);
+            update_p(&mut stage.norm2_gamma, &s_grads.grad_norm2_gamma, &mut sm.m_n2, &mut sm.v_n2);
             update_p(&mut stage.w1, &s_grads.grad_w1, &mut sm.m_w1, &mut sm.v_w1);
             update_p(&mut stage.w1u, &s_grads.grad_w1u, &mut sm.m_w1u, &mut sm.v_w1u);
             update_p(&mut stage.w2, &s_grads.grad_w2, &mut sm.m_w2, &mut sm.v_w2);
@@ -245,11 +258,14 @@ pub fn train_tessera(
         }
 
         axiom_core::tensor::vec_scale(&mut total_grads.grad_embed, scale);
+        axiom_core::tensor::vec_scale(&mut total_grads.grad_final_norm_gamma, scale);
         for sg in &mut total_grads.stage_grads {
+            axiom_core::tensor::vec_scale(&mut sg.grad_norm1_gamma, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_wq, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_wk, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_wv, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_wo, scale);
+            axiom_core::tensor::vec_scale(&mut sg.grad_norm2_gamma, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_w1, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_w1u, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_w2, scale);
@@ -257,7 +273,7 @@ pub fn train_tessera(
             axiom_core::tensor::vec_scale(&mut sg.grad_adapter_v, scale);
         }
 
-        let warmup = 20;
+        let warmup = 15;
         let current_lr = if step < warmup {
             let alpha = step as f32 / warmup as f32;
             1e-4 + alpha * (base_lr - 1e-4)
