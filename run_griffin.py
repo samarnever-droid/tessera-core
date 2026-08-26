@@ -1,5 +1,6 @@
-//! Standalone benchmark script for Google DeepMind Griffin.
-//! Runs ONLY Griffin on enwik8, measures BPC, decode speed, 8K needle recall, and saves griffin_results.json.
+"""Standalone benchmark script for Google DeepMind Griffin.
+Runs ONLY Griffin on enwik8, measures BPC, decode speed, 8K needle recall, and saves griffin_results.json.
+"""
 
 import json
 import math
