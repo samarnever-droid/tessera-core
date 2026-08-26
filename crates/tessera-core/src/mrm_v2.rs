@@ -1,8 +1,9 @@
 //! Multi-Resolution Working Memory v2 (MRM-v2) for TESSERA.
 //! Features:
-//! 1. Content-based Least-Recently-Queried (LRQ) and Salience eviction (solves FORGE 64-step eviction).
+//! 1. Content-based Least-Recently-Queried (LRQ) and Salience eviction with in-place deduplication.
 //! 2. Dual-Resolution storage: K_fine exact token slots + K_coarse EMA summary centroids.
-//! 3. Low-rank gated modulation: dense trunk dynamically gates memory reads.
+//! 3. Sharp Cosine Temperature Softmax (tau = 0.05) for high-precision needle discrimination.
+//! 4. Low-rank gated modulation: dense trunk dynamically gates memory reads.
 
 use axiom_core::matvec::{matvec, matvec_transposed, outer_product_accumulate};
 use axiom_core::softmax::softmax;
@@ -68,7 +69,7 @@ impl MrmV2Grads {
     }
 }
 
-/// Multi-Resolution Memory v2 with LRQ Eviction Policy.
+/// Multi-Resolution Memory v2 with LRQ Eviction Policy & Cosine Temperature Retrieval.
 #[derive(Debug, Clone)]
 pub struct MultiResMemoryV2 {
     pub d: usize,
@@ -135,16 +136,31 @@ impl MultiResMemoryV2 {
     }
 
     pub fn memory_footprint_bytes(&self) -> usize {
-        (self.k_fine * self.d * 2 + self.k_coarse * self.d * 2) * 4
+        (self.k_fine * self.d * 2 + self.k_coarse * self.d * 2 + self.k_fine * 2) * 4
     }
 
-    /// Insert / write an item into memory using Least-Recently-Queried (LRQ) eviction.
+    /// Insert / write an item into memory using Least-Recently-Queried (LRQ) eviction and in-place deduplication.
     pub fn write_token(&mut self, key_vec: &[f32], val_vec: &[f32], salience: f32) {
         let d = self.d;
         let k_fine = self.k_fine;
 
-        // Determine target slot
-        let slot_idx = if self.num_occupied_slots < k_fine {
+        // 1. In-place Deduplication: Check if an existing slot matches this key (Temporal Overwrite)
+        let key_norm = dot(key_vec, key_vec).sqrt().max(1e-8);
+        let mut match_slot = None;
+
+        for i in 0..self.num_occupied_slots {
+            let k_slice = &self.fine_keys[i * d..(i + 1) * d];
+            let k_norm = dot(k_slice, k_slice).sqrt().max(1e-8);
+            let sim = dot(key_vec, k_slice) / (key_norm * k_norm);
+            if sim >= 0.95 {
+                match_slot = Some(i);
+                break;
+            }
+        }
+
+        let slot_idx = if let Some(existing) = match_slot {
+            existing
+        } else if self.num_occupied_slots < k_fine {
             let idx = self.num_occupied_slots;
             self.num_occupied_slots += 1;
             idx
@@ -173,7 +189,8 @@ impl MultiResMemoryV2 {
         let mut max_sim = f32::NEG_INFINITY;
         for c in 0..self.k_coarse {
             let centroid = &self.coarse_centroids[c * d..(c + 1) * d];
-            let sim = dot(key_vec, centroid);
+            let c_norm = dot(centroid, centroid).sqrt().max(1e-8);
+            let sim = dot(key_vec, centroid) / (key_norm * c_norm);
             if sim > max_sim {
                 max_sim = sim;
                 best_centroid = c;
@@ -191,25 +208,30 @@ impl MultiResMemoryV2 {
         self.stats.total_writes += 1;
     }
 
-    /// Read from MRM-v2 using query vector Q.
+    /// Read from MRM-v2 using query vector Q with sharp Cosine Temperature Softmax (tau = 0.05).
     pub fn read_memory(&mut self, query_vec: &[f32], out_context: &mut [f32]) {
         let d = self.d;
         let k_fine = self.num_occupied_slots.max(1);
         let k_total = k_fine + self.k_coarse;
-        let scale = 1.0f32 / (d as f32).sqrt();
+        let q_norm = dot(query_vec, query_vec).sqrt().max(1e-8);
+        let temp = 0.05f32; // Sharp temperature for high discrimination
 
         let mut scores = vec![0.0f32; k_total];
 
-        // 1. Fine slot scores
+        // 1. Fine slot cosine scores
         for i in 0..k_fine {
             let k_slice = &self.fine_keys[i * d..(i + 1) * d];
-            scores[i] = dot(query_vec, k_slice) * scale;
+            let k_norm = dot(k_slice, k_slice).sqrt().max(1e-8);
+            let cos_sim = dot(query_vec, k_slice) / (q_norm * k_norm);
+            scores[i] = cos_sim / temp;
         }
 
-        // 2. Coarse slot scores
+        // 2. Coarse slot cosine scores
         for c in 0..self.k_coarse {
             let c_slice = &self.coarse_centroids[c * d..(c + 1) * d];
-            scores[k_fine + c] = dot(query_vec, c_slice) * scale;
+            let c_norm = dot(c_slice, c_slice).sqrt().max(1e-8);
+            let cos_sim = dot(query_vec, c_slice) / (q_norm * c_norm);
+            scores[k_fine + c] = cos_sim / temp;
         }
 
         // 3. Softmax
@@ -288,9 +310,7 @@ impl MultiResMemoryV2 {
         }
     }
 
-    /// Targeted Needle-in-Haystack 1K Retrieval Probe.
-    /// Inserts a salient needle key/value pair, feeds `distraction_tokens` random vectors,
-    /// then queries the memory with `needle_key` and measures cosine similarity of retrieved value.
+    /// Targeted Needle-in-Haystack Retrieval Probe.
     pub fn probe_needle_recall(&mut self, context_len: usize, seed: u64) -> f32 {
         let d = self.d;
         let mut rng = StdRng::seed_from_u64(seed);
@@ -304,8 +324,8 @@ impl MultiResMemoryV2 {
 
         // 2. Stream distraction tokens
         for _ in 0..context_len {
-            let dist_k: Vec<f32> = (0..d).map(|_| rng.gen_range(-0.1..0.1)).collect();
-            let dist_v: Vec<f32> = (0..d).map(|_| rng.gen_range(-0.1..0.1)).collect();
+            let dist_k: Vec<f32> = (0..d).map(|_| rng.gen_range(-1.0..1.0)).collect();
+            let dist_v: Vec<f32> = (0..d).map(|_| rng.gen_range(-1.0..1.0)).collect();
             self.write_token(&dist_k, &dist_v, 1.0);
         }
 
