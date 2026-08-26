@@ -1,5 +1,5 @@
-//! TESSERA-Q: Frontier Architecture with Depthwise 1D Causal Conv + 4-Head Attention + QK-Norm + RoPE + Affine RMSNorm + Tied Embeddings + Logit Soft-Capping + MRM-v2.
-//! Engineered to surpass Google DeepMind Griffin on BPC while retaining 100% 8K long-context recall.
+//! TESSERA-Q: Frontier Architecture with Depthwise 1D Causal Conv + QK-Norm + Value Residual (ResFormer) + RoPE + Affine RMSNorm + Tied Logits + Z-Loss + MRM-v2.
+//! Designed for Maximum Character/Token Modeling Density without taking any runtime loans.
 
 use crate::mrm_v2::{MrmV2Grads, MultiResMemoryV2};
 use axiom_core::matvec::{matvec, matvec_transposed, outer_product_accumulate};
@@ -132,7 +132,7 @@ impl TesseraConfig {
             d_model: 128,
             d_ff: 768,        // 6x expansion for peak expressivity
             n_heads: 4,
-            n_stages: 3,      // 3 progressive hierarchy stages (optimal for 120 steps)
+            n_stages: 3,      // 3 progressive hierarchy stages
             adapter_rank: 8,
             use_mrm_v2: true,
             k_fine_slots: 128,
@@ -212,7 +212,7 @@ impl TesseraStageGrads {
     }
 }
 
-/// A Progressive Hierarchy Stage with 1D Conv + 4-Head Attention + QK-Norm + RoPE + Affine RMSNorm + SwiGLU + MRM-v2.
+/// A Progressive Hierarchy Stage with 1D Conv + 4-Head Attention + QK-Norm + Value Residual + RoPE + Affine RMSNorm + SwiGLU + MRM-v2.
 #[derive(Debug, Clone)]
 pub struct TesseraStage {
     pub d_model: usize,
@@ -343,7 +343,7 @@ impl TesseraModelGrads {
     }
 }
 
-/// Full TESSERA Architecture with 1D Conv + QK-Norm + RoPE + Affine RMSNorm + Tied Logits + Soft-Capping.
+/// Full TESSERA Architecture with 1D Conv + QK-Norm + Value Residual + RoPE + Affine RMSNorm + Tied Logits + Z-Loss.
 #[derive(Debug, Clone)]
 pub struct TesseraModel {
     pub vocab_size: usize,
@@ -406,7 +406,7 @@ impl TesseraModel {
         (total_params, active_params, dram_bytes_per_token, resident_l3_bytes)
     }
 
-    /// Full forward-backward pass through TESSERA with 1D Conv + QK-Norm + RoPE + Soft-Capping.
+    /// Full forward-backward pass through TESSERA with 1D Conv + QK-Norm + Value Residual + Z-Loss.
     pub fn forward_backward_sequence(
         &mut self,
         x_seq: &[usize],
@@ -421,6 +421,7 @@ impl TesseraModel {
         let scale_attn = 1.0f32 / (d_k as f32).sqrt();
         let eps = 1e-5f32;
         let logit_cap = 30.0f32;
+        let z_loss_coeff = 1e-4f32;
 
         let d_ff = self.stages[0].d_ff;
         let r_adapt = self.stages[0].adapter_rank;
@@ -475,8 +476,10 @@ impl TesseraModel {
         let mut stage_hnorm2 = Vec::with_capacity(self.stages.len());
         let mut stage_rms2 = Vec::with_capacity(self.stages.len());
 
+        let mut v0_cache: Option<Vec<f32>> = None;
+
         // 2. Progressive Folding Stages
-        for stage in &mut self.stages {
+        for (s_idx, stage) in self.stages.iter_mut().enumerate() {
             let h_in = h_curr.clone();
             stage_h_in.push(h_in.clone());
 
@@ -507,7 +510,7 @@ impl TesseraModel {
             }
             stage_h_conv.push(h_conv.clone());
 
-            // C. 4-Head Causal Self-Attention with QK-Norm & RoPE
+            // C. 4-Head Causal Self-Attention with QK-Norm, Value Residual, & RoPE
             let wq_v = MatrixView::new(&stage.wq, d, d);
             let wk_v = MatrixView::new(&stage.wk, d, d);
             let wv_v = MatrixView::new(&stage.wv, d, d);
@@ -528,6 +531,15 @@ impl TesseraModel {
                     let h_offset = h * d_k;
                     apply_rope(&mut q_mat[t * d + h_offset..t * d + h_offset + d_k], t, d_k);
                     apply_rope(&mut k_mat[t * d + h_offset..t * d + h_offset + d_k], t, d_k);
+                }
+            }
+
+            // Value Residual Learning (ResFormer): V_s = 0.7 V_s + 0.3 V_0
+            if s_idx == 0 {
+                v0_cache = Some(v_mat.clone());
+            } else if let Some(ref v0) = v0_cache {
+                for i in 0..t_len * d {
+                    v_mat[i] = 0.7 * v_mat[i] + 0.3 * v0[i];
                 }
             }
 
@@ -645,7 +657,7 @@ impl TesseraModel {
             h_curr = h_stage_out;
         }
 
-        // 3. Final Affine RMSNorm + Tied Output Logits with Soft-Capping
+        // 3. Final Affine RMSNorm + Tied Output Logits with Soft-Capping & Z-Loss
         let mut h_final_norm = vec![0.0f32; t_len * d];
         let mut rms_final = vec![0.0f32; t_len];
         for t in 0..t_len {
@@ -671,7 +683,21 @@ impl TesseraModel {
             }
 
             let loss = cross_entropy_loss_and_grad(&buf_capped_logits, y_seq[t], &mut buf_pred_probs, &mut buf_pred_grad);
-            total_loss += loss;
+
+            // Z-Loss: 1e-4 * (log sum exp(logits))^2
+            let mut max_l = buf_capped_logits[0];
+            for &l in &buf_capped_logits[1..] { if l > max_l { max_l = l; } }
+            let mut sum_exp = 0.0f32;
+            for &l in &buf_capped_logits { sum_exp += (l - max_l).exp(); }
+            let log_z = max_l + sum_exp.ln();
+            let z_loss = z_loss_coeff * log_z * log_z;
+            total_loss += loss + z_loss;
+
+            // Z-Loss gradient: 2 * z_loss_coeff * log_z * prob_i
+            let z_grad_scale = 2.0f32 * z_loss_coeff * log_z;
+            for i in 0..v {
+                buf_pred_grad[i] += z_grad_scale * buf_pred_probs[i];
+            }
 
             // Backprop through soft-capping
             for i in 0..v {
@@ -702,6 +728,8 @@ impl TesseraModel {
         }
 
         // 4. Backward Pass through Progressive Stages
+        let mut dv0_accum = vec![0.0f32; t_len * d];
+
         for (s_idx, stage) in self.stages.iter().enumerate().rev() {
             let s_grads = &mut grads.stage_grads[s_idx];
             let h_stage_in = &stage_h_in[s_idx];
@@ -847,6 +875,18 @@ impl TesseraModel {
                         vec_add_scaled(&mut dq_norm[i * d + h_offset..i * d + h_offset + d_k], kj, d_score_j);
                         vec_add_scaled(&mut dk_norm[j * d + h_offset..j * d + h_offset + d_k], qi, d_score_j);
                     }
+                }
+            }
+
+            // Backprop through Value Residual Connection (ResFormer)
+            if s_idx > 0 {
+                for i in 0..t_len * d {
+                    dv0_accum[i] += 0.3 * dv_mat[i];
+                    dv_mat[i] *= 0.7;
+                }
+            } else {
+                for i in 0..t_len * d {
+                    dv_mat[i] += dv0_accum[i];
                 }
             }
 
