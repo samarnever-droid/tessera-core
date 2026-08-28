@@ -33,13 +33,13 @@ pub struct StageMoments {
 }
 
 impl StageMoments {
-    pub fn new(d: usize, d_ff: usize, r: usize, use_mrm: bool) -> Self {
+    pub fn new(d: usize, d_ff: usize, r: usize, use_mrm: bool, eta_len: usize) -> Self {
         Self {
             m_n1: vec![0.0f32; d], v_n1: vec![0.0f32; d],
             m_conv: vec![0.0f32; 4 * d], v_conv: vec![0.0f32; 4 * d],
             m_gate_attn: vec![0.0f32; d * d], v_gate_attn: vec![0.0f32; d * d],
             m_lambda: vec![0.0f32; 2], v_lambda: vec![0.0f32; 2],
-            m_eta: vec![0.0f32; 16], v_eta: vec![0.0f32; 16],
+            m_eta: vec![0.0f32; eta_len], v_eta: vec![0.0f32; eta_len],
             m_wq: vec![0.0f32; d * d], v_wq: vec![0.0f32; d * d],
             m_wk: vec![0.0f32; d * d], v_wk: vec![0.0f32; d * d],
             m_wv: vec![0.0f32; d * d], v_wv: vec![0.0f32; d * d],
@@ -82,7 +82,7 @@ pub struct TesseraAdamW {
 impl TesseraAdamW {
     pub fn new(model: &TesseraModel, lr: f32) -> Self {
         let stage_moments = model.stages.iter().map(|s| {
-            StageMoments::new(s.d_model, s.d_ff, s.adapter_rank, s.mrm.is_some())
+            StageMoments::new(s.d_model, s.d_ff, s.adapter_rank, s.mrm.is_some(), s.eta_rope.len())
         }).collect();
 
         Self {
