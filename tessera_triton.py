@@ -15,6 +15,12 @@ Features:
 import math
 import os
 import sys
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -165,13 +171,14 @@ class TritonMRMReadFunction(torch.autograd.Function):
         sim = torch.bmm(Q.unsqueeze(1), Keys.transpose(1, 2)) / (q_norm.unsqueeze(1) * k_norm.transpose(1, 2))
         probs = F.softmax(sim / tau, dim=-1)
 
-        grad_vals = probs.transpose(1, 2) @ grad_out.unsqueeze(1)
-        # Gradient back to Q
+        grad_vals = torch.bmm(probs.transpose(1, 2), grad_out.unsqueeze(1))
+        # Gradient back to Q and Keys
         grad_probs = torch.bmm(grad_out.unsqueeze(1), Vals.transpose(1, 2))
         d_scores = (probs * (grad_probs - (probs * grad_probs).sum(dim=-1, keepdim=True))) / tau
         grad_q = torch.bmm(d_scores, Keys).squeeze(1) / q_norm
+        grad_keys = torch.bmm(d_scores.transpose(1, 2), Q.unsqueeze(1)) / k_norm
 
-        return grad_q, None, grad_vals, None, None
+        return grad_q, grad_keys, grad_vals, None, None
 
 
 # =================================================================================================

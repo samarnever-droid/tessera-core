@@ -101,11 +101,20 @@ pub fn apply_adaptive_rope(vec: &mut [f32], pos: usize, d_k: usize, eta: &[f32])
 
 /// Apply Adaptive Rotary Position Embedding (RoPE) backward
 #[inline]
-pub fn apply_adaptive_rope_backward(d_out: &[f32], d_in: &mut [f32], pos: usize, d_k: usize, eta: &[f32]) {
+pub fn apply_adaptive_rope_backward(
+    d_out: &[f32],
+    d_in: &mut [f32],
+    x_raw: &[f32],
+    pos: usize,
+    d_k: usize,
+    eta: &[f32],
+    grad_eta: &mut [f32],
+) {
     let half = d_k / 2;
     for i in 0..half {
         let base_theta = 1.0f32 / (10000.0f32.powf((2 * i) as f32 / d_k as f32));
-        let scale = 2.0f32 / (1.0f32 + (-eta[i]).exp());
+        let sig = 1.0f32 / (1.0f32 + (-eta[i]).exp());
+        let scale = 2.0f32 * sig;
         let theta = base_theta * scale;
         let angle = pos as f32 * theta;
         let cos_a = angle.cos();
@@ -115,6 +124,13 @@ pub fn apply_adaptive_rope_backward(d_out: &[f32], d_in: &mut [f32], pos: usize,
         let g1 = d_out[2 * i + 1];
         d_in[2 * i] = g0 * cos_a + g1 * sin_a;
         d_in[2 * i + 1] = -g0 * sin_a + g1 * cos_a;
+
+        // Gradient w.r.t eta[i]
+        let v0 = x_raw[2 * i];
+        let v1 = x_raw[2 * i + 1];
+        let d_angle = g0 * (-v0 * sin_a - v1 * cos_a) + g1 * (v0 * cos_a - v1 * sin_a);
+        let d_scale = d_angle * pos as f32 * base_theta;
+        grad_eta[i] += d_scale * 2.0f32 * sig * (1.0f32 - sig);
     }
 }
 
@@ -128,6 +144,7 @@ pub struct TesseraConfig {
     pub use_mrm_v2: bool,     // Ablation flag (Arm B vs Arm C)
     pub k_fine_slots: usize,  // 128 fine slots
     pub k_coarse_slots: usize,// 16 coarse slots
+    pub use_meridian: bool,   // Inbuilt Native Meridian Vector Memory
 }
 
 impl TesseraConfig {
@@ -141,6 +158,7 @@ impl TesseraConfig {
             use_mrm_v2: true,
             k_fine_slots: 128,
             k_coarse_slots: 16,
+            use_meridian: true,
         }
     }
 }
@@ -391,6 +409,7 @@ pub struct TesseraModel {
     pub final_norm_gamma: Vec<f32>,
     pub w_mtp_proj: Vec<f32>,
     pub w_mtp_head: Vec<f32>,
+    pub meridian_memory: Option<crate::tessera_meridian_engine::InbuiltMeridianMemory>,
 }
 
 impl TesseraModel {
@@ -419,6 +438,14 @@ impl TesseraModel {
         let w_mtp_proj = (0..config.d_model * config.d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let w_mtp_head = (0..vocab_size * config.d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
 
+        let meridian_memory = if config.use_meridian {
+            let mut mem_cfg = crate::tessera_meridian_engine::MeridianMemoryConfig::default();
+            mem_cfg.dim = config.d_model;
+            Some(crate::tessera_meridian_engine::InbuiltMeridianMemory::new(mem_cfg, seed + 999))
+        } else {
+            None
+        };
+
         Self {
             vocab_size,
             d_model: config.d_model,
@@ -429,7 +456,144 @@ impl TesseraModel {
             final_norm_gamma,
             w_mtp_proj,
             w_mtp_head,
+            meridian_memory,
         }
+    }
+
+    pub fn save_binary(&self, path: &str) -> std::io::Result<()> {
+        use std::fs::File;
+        use std::io::Write;
+        let mut f = File::create(path)?;
+        f.write_all(&(self.vocab_size as u32).to_le_bytes())?;
+        f.write_all(&(self.d_model as u32).to_le_bytes())?;
+        f.write_all(&(self.config.d_ff as u32).to_le_bytes())?;
+        f.write_all(&(self.stages.len() as u32).to_le_bytes())?;
+
+        fn write_floats(f: &mut File, slice: &[f32]) -> std::io::Result<()> {
+            let byte_slice = unsafe {
+                std::slice::from_raw_parts(slice.as_ptr() as *const u8, slice.len() * 4)
+            };
+            f.write_all(byte_slice)
+        }
+
+        write_floats(&mut f, &self.embeddings)?;
+
+        for stage in &self.stages {
+            write_floats(&mut f, &stage.norm1_gamma)?;
+            write_floats(&mut f, &stage.w_conv)?;
+            write_floats(&mut f, &stage.w_gate_attn)?;
+            write_floats(&mut f, &stage.lambda_diff)?;
+            write_floats(&mut f, &stage.eta_rope)?;
+            write_floats(&mut f, &stage.wq)?;
+            write_floats(&mut f, &stage.wk)?;
+            write_floats(&mut f, &stage.wv)?;
+            write_floats(&mut f, &stage.wo)?;
+            write_floats(&mut f, &stage.norm2_gamma)?;
+            write_floats(&mut f, &stage.w1)?;
+            write_floats(&mut f, &stage.w1u)?;
+            write_floats(&mut f, &stage.w2)?;
+        }
+
+        write_floats(&mut f, &self.final_norm_gamma)?;
+        Ok(())
+    }
+
+    pub fn load_binary(path: &str) -> std::io::Result<Self> {
+        use std::fs::File;
+        use std::io::Read;
+        let mut f = File::open(path)?;
+
+        let mut header = [0u8; 16];
+        f.read_exact(&mut header)?;
+        let vocab_size = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+        let d_model = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        let d_ff = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+        let n_stages = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+
+        fn read_floats(f: &mut File, count: usize) -> std::io::Result<Vec<f32>> {
+            let mut vec = vec![0.0f32; count];
+            let byte_slice = unsafe {
+                std::slice::from_raw_parts_mut(vec.as_mut_ptr() as *mut u8, count * 4)
+            };
+            f.read_exact(byte_slice)?;
+            Ok(vec)
+        }
+
+        let embeddings = read_floats(&mut f, vocab_size * d_model)?;
+
+        let mut config = TesseraConfig::nano_default();
+        config.d_model = d_model;
+        config.d_ff = d_ff;
+        config.n_stages = n_stages;
+
+        let mut stages = Vec::with_capacity(n_stages);
+        for p in 0..n_stages {
+            let norm1_gamma = read_floats(&mut f, d_model)?;
+            let w_conv = read_floats(&mut f, 4 * d_model)?;
+            let w_gate_attn = read_floats(&mut f, d_model * d_model)?;
+            let lambda_diff = read_floats(&mut f, 2)?;
+            let eta_rope = read_floats(&mut f, 16)?;
+            let wq = read_floats(&mut f, d_model * d_model)?;
+            let wk = read_floats(&mut f, d_model * d_model)?;
+            let wv = read_floats(&mut f, d_model * d_model)?;
+            let wo = read_floats(&mut f, d_model * d_model)?;
+            let norm2_gamma = read_floats(&mut f, d_model)?;
+            let w1 = read_floats(&mut f, d_ff * d_model)?;
+            let w1u = read_floats(&mut f, d_ff * d_model)?;
+            let w2 = read_floats(&mut f, d_model * d_ff)?;
+
+            let mut stage = TesseraStage::new(
+                d_model,
+                d_ff,
+                config.n_heads,
+                config.adapter_rank,
+                config.use_mrm_v2 && p == n_stages - 1,
+                config.k_fine_slots,
+                config.k_coarse_slots,
+                42 + p as u64,
+            );
+
+            stage.norm1_gamma = norm1_gamma;
+            stage.w_conv = w_conv;
+            stage.w_gate_attn = w_gate_attn;
+            stage.lambda_diff = lambda_diff;
+            stage.eta_rope = eta_rope;
+            stage.wq = wq;
+            stage.wk = wk;
+            stage.wv = wv;
+            stage.wo = wo;
+            stage.norm2_gamma = norm2_gamma;
+            stage.w1 = w1;
+            stage.w1u = w1u;
+            stage.w2 = w2;
+
+            stages.push(stage);
+        }
+
+        let final_norm_gamma = read_floats(&mut f, d_model)?;
+        let w_mtp_proj = vec![0.0f32; d_model * d_model];
+        let w_mtp_head = vec![0.0f32; vocab_size * d_model];
+
+        let meridian_memory = if config.use_meridian {
+            let mut mem_cfg = crate::tessera_meridian_engine::MeridianMemoryConfig::default();
+            mem_cfg.dim = config.d_model;
+            Some(crate::tessera_meridian_engine::InbuiltMeridianMemory::new(mem_cfg, 999))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            vocab_size,
+            d_model,
+            max_seq_len: 2048,
+            config,
+            embeddings,
+            stages,
+            final_norm_gamma,
+            w_mtp_proj,
+            w_mtp_head,
+            meridian_memory,
+        })
     }
 
     pub fn parameter_metrics(&self) -> (usize, usize, usize, usize) {
@@ -447,6 +611,274 @@ impl TesseraModel {
         let resident_l3_bytes = total_params * 4;
 
         (total_params, active_params, dram_bytes_per_token, resident_l3_bytes)
+    }
+
+    /// Compute forward pass and return output logits for the last token in the sequence.
+    pub fn forward_last_logits(&mut self, x_seq: &[usize]) -> Vec<f32> {
+        let t_len = x_seq.len();
+        let d = self.d_model;
+        let v = self.vocab_size;
+        let n_subheads = self.config.n_heads;
+        let n_pairs = n_subheads / 2;
+        let d_k = d / n_subheads;
+        let d_v_pair = d / n_pairs;
+        let scale_attn = 1.0f32 / (d_k as f32).sqrt();
+        let eps = 1e-5f32;
+        let logit_cap = 30.0f32;
+
+        let mut h_curr = vec![0.0f32; t_len * d];
+        for t in 0..t_len {
+            let tok = x_seq[t];
+            let embed = &self.embeddings[tok * d..(tok + 1) * d];
+            for i in 0..d {
+                h_curr[t * d + i] = embed[i];
+            }
+        }
+
+        let mut v0_cache: Option<Vec<f32>> = None;
+
+        for stage in self.stages.iter_mut() {
+            let mut h_norm1 = vec![0.0f32; t_len * d];
+            for t in 0..t_len {
+                let ht = &h_curr[t * d..(t + 1) * d];
+                let out_t = &mut h_norm1[t * d..(t + 1) * d];
+                rms_norm_affine(ht, &stage.norm1_gamma, out_t, eps);
+            }
+
+            let mut h_conv = vec![0.0f32; t_len * d];
+            for t in 0..t_len {
+                for i in 0..d {
+                    let mut sum = 0.0f32;
+                    for k in 0..4 {
+                        if t >= k {
+                            let in_val = h_norm1[(t - k) * d + i];
+                            sum += in_val * stage.w_conv[k * d + i];
+                        }
+                    }
+                    h_conv[t * d + i] = sum;
+                }
+            }
+
+            let mut h_gated = vec![0.0f32; t_len * d];
+            let w_gate_v = MatrixView::new(&stage.w_gate_attn, d, d);
+            let mut buf_gate = vec![0.0f32; d];
+            for t in 0..t_len {
+                let ht = &h_norm1[t * d..(t + 1) * d];
+                matvec(&w_gate_v, ht, &mut buf_gate);
+                for i in 0..d {
+                    let sig = 1.0f32 / (1.0f32 + (-buf_gate[i]).exp());
+                    h_gated[t * d + i] = h_conv[t * d + i] * sig;
+                }
+            }
+
+            let wq_v = MatrixView::new(&stage.wq, d, d);
+            let wk_v = MatrixView::new(&stage.wk, d, d);
+            let wv_v = MatrixView::new(&stage.wv, d, d);
+
+            let mut q_mat = vec![0.0f32; t_len * d];
+            let mut k_mat = vec![0.0f32; t_len * d];
+            let mut v_mat = vec![0.0f32; t_len * d];
+
+            for t in 0..t_len {
+                let ht = &h_gated[t * d..(t + 1) * d];
+                matvec(&wq_v, ht, &mut q_mat[t * d..(t + 1) * d]);
+                matvec(&wk_v, ht, &mut k_mat[t * d..(t + 1) * d]);
+                matvec(&wv_v, ht, &mut v_mat[t * d..(t + 1) * d]);
+            }
+
+            let mut q_norm = vec![0.0f32; t_len * d];
+            let mut k_norm = vec![0.0f32; t_len * d];
+            for t in 0..t_len {
+                for h in 0..n_subheads {
+                    let h_offset = h * d_k;
+                    let mut q_rope = vec![0.0f32; d_k];
+                    let mut k_rope = vec![0.0f32; d_k];
+                    q_rope.copy_from_slice(&q_mat[t * d + h_offset..t * d + h_offset + d_k]);
+                    k_rope.copy_from_slice(&k_mat[t * d + h_offset..t * d + h_offset + d_k]);
+                    apply_adaptive_rope(&mut q_rope, t, d_k, &stage.eta_rope);
+                    apply_adaptive_rope(&mut k_rope, t, d_k, &stage.eta_rope);
+
+                    rms_norm_head(&q_rope, &mut q_norm[t * d + h_offset..t * d + h_offset + d_k], eps);
+                    rms_norm_head(&k_rope, &mut k_norm[t * d + h_offset..t * d + h_offset + d_k], eps);
+                }
+            }
+
+            let current_v = if let Some(ref v0) = v0_cache {
+                let mut v_res = vec![0.0f32; t_len * d];
+                for i in 0..t_len * d {
+                    v_res[i] = 0.7f32 * v_mat[i] + 0.3f32 * v0[i];
+                }
+                v_res
+            } else {
+                v0_cache = Some(v_mat.clone());
+                v_mat
+            };
+
+            let mut attn_out = vec![0.0f32; t_len * d];
+            let wo_v = MatrixView::new(&stage.wo, d, d);
+            let mut buf_fused = vec![0.0f32; d];
+            let mut scores1 = vec![0.0f32; t_len];
+            let mut scores2 = vec![0.0f32; t_len];
+            let mut probs1 = vec![0.0f32; t_len];
+            let mut probs2 = vec![0.0f32; t_len];
+
+            for t in 0..t_len {
+                buf_fused.fill(0.0f32);
+                for p in 0..n_pairs {
+                    let h1 = p * 2;
+                    let h2 = p * 2 + 1;
+                    let off_q1 = h1 * d_k;
+                    let off_q2 = h2 * d_k;
+                    let off_v = p * d_v_pair;
+
+                    let q1 = &q_norm[t * d + off_q1..t * d + off_q1 + d_k];
+                    let q2 = &q_norm[t * d + off_q2..t * d + off_q2 + d_k];
+
+                    for tau in 0..=t {
+                        let k1 = &k_norm[tau * d + off_q1..tau * d + off_q1 + d_k];
+                        let k2 = &k_norm[tau * d + off_q2..tau * d + off_q2 + d_k];
+                        scores1[tau] = dot(q1, k1) * scale_attn;
+                        scores2[tau] = dot(q2, k2) * scale_attn;
+                    }
+
+                    softmax(&scores1[0..=t], &mut probs1[0..=t]);
+                    softmax(&scores2[0..=t], &mut probs2[0..=t]);
+
+                    let lambda_eff = (stage.lambda_diff[0].exp() - stage.lambda_diff[1].exp() + 0.8f32).max(0.0f32);
+
+                    for tau in 0..=t {
+                        let diff_w = probs1[tau] - lambda_eff * probs2[tau];
+                        let v_vec = &current_v[tau * d + off_v..tau * d + off_v + d_v_pair];
+                        vec_add_scaled(&mut buf_fused[off_v..off_v + d_v_pair], v_vec, diff_w);
+                    }
+                }
+                matvec(&wo_v, &buf_fused, &mut attn_out[t * d..(t + 1) * d]);
+            }
+
+            let mut h_mid = vec![0.0f32; t_len * d];
+            for i in 0..t_len * d {
+                h_mid[i] = h_curr[i] + attn_out[i];
+            }
+
+            let mut h_norm2 = vec![0.0f32; t_len * d];
+            for t in 0..t_len {
+                let ht = &h_mid[t * d..(t + 1) * d];
+                let out_t = &mut h_norm2[t * d..(t + 1) * d];
+                rms_norm_affine(ht, &stage.norm2_gamma, out_t, eps);
+            }
+
+            let w1_v = MatrixView::new(&stage.w1, stage.d_ff, d);
+            let w1u_v = MatrixView::new(&stage.w1u, stage.d_ff, d);
+            let w2_v = MatrixView::new(&stage.w2, d, stage.d_ff);
+            let r = stage.adapter_rank;
+            let v_view = MatrixView::new(&stage.adapter_v, r, d);
+            let u_view = MatrixView::new(&stage.adapter_u, d, r);
+
+            let mut h_stage_out = h_mid;
+            let mut buf_gate = vec![0.0f32; stage.d_ff];
+            let mut buf_up = vec![0.0f32; stage.d_ff];
+            let mut buf_ff = vec![0.0f32; stage.d_ff];
+            let mut buf_ff_out = vec![0.0f32; d];
+            let mut buf_ad_m = vec![0.0f32; r];
+            let mut buf_ad_o = vec![0.0f32; d];
+
+            for t in 0..t_len {
+                let ht = &h_norm2[t * d..(t + 1) * d];
+                matvec(&w1_v, ht, &mut buf_gate);
+                matvec(&w1u_v, ht, &mut buf_up);
+
+                for i in 0..stage.d_ff {
+                    let g = buf_gate[i];
+                    let silu = g / (1.0 + (-g).exp());
+                    buf_ff[i] = silu * buf_up[i];
+                }
+                matvec(&w2_v, &buf_ff, &mut buf_ff_out);
+                matvec(&v_view, ht, &mut buf_ad_m);
+                matvec(&u_view, &buf_ad_m, &mut buf_ad_o);
+
+                let out_slice = &mut h_stage_out[t * d..(t + 1) * d];
+                vec_add_scaled(out_slice, &buf_ff_out, 1.0);
+                vec_add_scaled(out_slice, &buf_ad_o, 1.0);
+            }
+
+            if let Some(ref mut mrm) = stage.mrm {
+                let mut mrm_out = vec![0.0f32; t_len * d];
+                mrm.forward_sequence(&h_stage_out, t_len, &mut mrm_out);
+                h_stage_out = mrm_out;
+            }
+
+            h_curr = h_stage_out;
+        }
+
+        // Inbuilt Native Meridian Vector Memory Fusion
+        if let Some(ref mem) = self.meridian_memory {
+            for t in 0..t_len {
+                let tok = x_seq[t];
+                let ht = &h_curr[t * d..(t + 1) * d];
+                let fused_t = mem.forward_step(ht, tok, true);
+                h_curr[t * d..(t + 1) * d].copy_from_slice(&fused_t);
+            }
+        }
+
+        // Final RMSNorm on last token
+        let last_t = t_len - 1;
+        let mut h_last_norm = vec![0.0f32; d];
+        rms_norm_affine(&h_curr[last_t * d..(last_t + 1) * d], &self.final_norm_gamma, &mut h_last_norm, eps);
+
+        let embed_view = MatrixView::new(&self.embeddings, v, d);
+        let mut raw_logits = vec![0.0f32; v];
+        matvec(&embed_view, &h_last_norm, &mut raw_logits);
+
+        let mut logits = vec![0.0f32; v];
+        for i in 0..v {
+            logits[i] = logit_cap * (raw_logits[i] / logit_cap).tanh();
+        }
+
+        logits
+    }
+
+    /// Autoregressively sample tokens from prompt string.
+    pub fn generate_text(&mut self, prompt: &str, max_new_tokens: usize, temperature: f32, top_k: usize, seed: u64) -> String {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut tokens: Vec<usize> = prompt.as_bytes().iter().map(|&b| b as usize).collect();
+        if tokens.is_empty() {
+            tokens.push(b' ' as usize);
+        }
+
+        for _ in 0..max_new_tokens {
+            let ctx = if tokens.len() > self.max_seq_len {
+                &tokens[tokens.len() - self.max_seq_len..]
+            } else {
+                &tokens[..]
+            };
+
+            let logits = self.forward_last_logits(ctx);
+
+            // Apply temperature
+            let mut scaled_logits: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &l)| (i, l / temperature.max(1e-4))).collect();
+            scaled_logits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let k = top_k.min(scaled_logits.len()).max(1);
+            let top_items = &scaled_logits[..k];
+            let max_val = top_items[0].1;
+            let exp_sum: f32 = top_items.iter().map(|(_, l)| (l - max_val).exp()).sum();
+
+            let mut r: f32 = rng.gen_range(0.0..exp_sum);
+            let mut next_tok = top_items[0].0;
+            for (idx, l) in top_items {
+                let p = (l - max_val).exp();
+                if r <= p {
+                    next_tok = *idx;
+                    break;
+                }
+                r -= p;
+            }
+
+            tokens.push(next_tok);
+        }
+
+        let bytes: Vec<u8> = tokens.iter().map(|&t| (t % 256) as u8).collect();
+        String::from_utf8_lossy(&bytes).to_string()
     }
 
     /// Full forward-backward pass through TESSERA with Multi-Token Prediction (MTP) + Microsoft Differential Attention + Gated Attention + 1D Conv + QK-Norm + Value Residual + Z-Loss.
@@ -531,6 +963,7 @@ impl TesseraModel {
         let mut stage_h_mid = Vec::with_capacity(self.stages.len());
         let mut stage_hnorm2 = Vec::with_capacity(self.stages.len());
         let mut stage_rms2 = Vec::with_capacity(self.stages.len());
+        let mut stage_h_pre_mrm = Vec::with_capacity(self.stages.len());
 
         let mut v0_cache: Option<Vec<f32>> = None;
 
@@ -751,6 +1184,7 @@ impl TesseraModel {
             }
 
             // G. MRM-v2 Active Working Memory
+            stage_h_pre_mrm.push(h_stage_out.clone());
             if let Some(ref mut mrm) = stage.mrm {
                 let mut mrm_out = vec![0.0f32; t_len * d];
                 mrm.forward_sequence(&h_stage_out, t_len, &mut mrm_out);
@@ -773,7 +1207,6 @@ impl TesseraModel {
         let mut grad_embed_view = MatrixViewMut::new(&mut grads.grad_embed, v, d);
         let mut delta_head = vec![0.0f32; t_len * d];
         let mut total_loss = 0.0f32;
-        let mut ntp_loss_eval = 0.0f32;
 
         let w_mtp_proj_v = MatrixView::new(&self.w_mtp_proj, d, d);
         let w_mtp_head_v = MatrixView::new(&self.w_mtp_head, v, d);
@@ -792,7 +1225,6 @@ impl TesseraModel {
             }
 
             let loss = cross_entropy_loss_and_grad(&buf_capped_logits, y_seq[t], &mut buf_pred_probs, &mut buf_pred_grad);
-            ntp_loss_eval += loss;
 
             // Z-Loss: 1e-4 * (log sum exp(logits))^2
             let mut max_l = buf_capped_logits[0];
@@ -881,6 +1313,22 @@ impl TesseraModel {
             let attn_fused = &stage_attn_fused[s_idx];
             let attn_probs_all = &stage_attn_probs_all[s_idx];
 
+            // MRM-v2 Backward (if attached to this stage)
+            let h_pre_mrm = &stage_h_pre_mrm[s_idx];
+            let delta_stage_out = if let Some(ref mrm) = stage.mrm {
+                let mut d_mrm_in = vec![0.0f32; t_len * d];
+                mrm.backward_sequence(
+                    h_pre_mrm,
+                    &delta_upstream,
+                    &mut d_mrm_in,
+                    s_grads.mrm_grads.as_mut().unwrap(),
+                    t_len,
+                );
+                d_mrm_in
+            } else {
+                delta_upstream.clone()
+            };
+
             // SwiGLU + Adapter Backward
             let w1_v = MatrixView::new(&stage.w1, stage.d_ff, d);
             let w1u_v = MatrixView::new(&stage.w1u, stage.d_ff, d);
@@ -897,7 +1345,7 @@ impl TesseraModel {
             let mut delta_hnorm2 = vec![0.0f32; t_len * d];
 
             for t in 0..t_len {
-                let dh = &delta_upstream[t * d..(t + 1) * d];
+                let dh = &delta_stage_out[t * d..(t + 1) * d];
                 let ht_norm = &h_norm2[t * d..(t + 1) * d];
 
                 matvec(&w1_v, ht_norm, &mut buf_gate);
@@ -941,7 +1389,7 @@ impl TesseraModel {
             }
 
             // Backprop through Affine RMSNorm 2 + Residual
-            let mut delta_mid = delta_upstream.clone();
+            let mut delta_mid = delta_stage_out;
             for t in 0..t_len {
                 let ht_mid = &h_mid[t * d..(t + 1) * d];
                 let d_hn = &delta_hnorm2[t * d..(t + 1) * d];
@@ -1105,16 +1553,20 @@ impl TesseraModel {
                     apply_adaptive_rope_backward(
                         &dq_rope[t * d + h_offset..t * d + h_offset + d_k],
                         &mut dq_mat[t * d + h_offset..t * d + h_offset + d_k],
+                        &q_raw[t * d + h_offset..t * d + h_offset + d_k],
                         t,
                         d_k,
                         &stage.eta_rope,
+                        &mut s_grads.grad_eta_rope,
                     );
                     apply_adaptive_rope_backward(
                         &dk_rope[t * d + h_offset..t * d + h_offset + d_k],
                         &mut dk_mat[t * d + h_offset..t * d + h_offset + d_k],
+                        &k_raw[t * d + h_offset..t * d + h_offset + d_k],
                         t,
                         d_k,
                         &stage.eta_rope,
+                        &mut s_grads.grad_eta_rope,
                     );
                 }
             }
@@ -1203,6 +1655,6 @@ impl TesseraModel {
             }
         }
 
-        ntp_loss_eval
+        total_loss
     }
 }

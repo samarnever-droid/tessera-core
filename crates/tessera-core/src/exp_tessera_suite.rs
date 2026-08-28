@@ -216,7 +216,7 @@ pub fn run_protocol_6_wall_clock_profiling() {
 
     let cfg_full = TesseraConfig::nano_default();
     let mut model = TesseraModel::new(256, 64, cfg_full, 42);
-    let mut tf = TransformerModel::new(256, 128, 2, 512, 64, 42);
+    let tf = TransformerModel::new(256, 128, 2, 512, 64, 42);
 
     let num_tokens = 500;
     let dummy_seq = vec![42usize; 64];

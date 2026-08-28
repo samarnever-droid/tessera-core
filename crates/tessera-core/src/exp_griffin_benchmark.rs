@@ -108,7 +108,7 @@ pub fn run_griffin_showdown(dataset_path: &str, steps: usize) {
         (name.to_string(), tok_s, p50, p90, p99)
     };
 
-    let mut tf_mut = tf.clone();
+    let tf_mut = tf.clone();
     let seq_tf = dummy_seq.clone();
     let r_tf = profile_model("Dense Transformer (0.73M)", Box::new(move || {
         let t0 = Instant::now();

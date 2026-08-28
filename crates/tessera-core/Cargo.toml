@@ -5,13 +5,45 @@ edition = "2021"
 description = "TESSERA: Temporal-Hierarchical State with Structured Resonance & Active Working Memory"
 
 [dependencies]
-axiom-core     = { path = "../axiom-core" }
-axiom-baseline = { path = "../axiom-baseline" }
-axiom-train    = { path = "../axiom-train" }
-rand           = "0.8"
-rayon          = "1.10"
-sysinfo        = "0.30"
+axiom-core      = { path = "../axiom-core" }
+axiom-baseline  = { path = "../axiom-baseline" }
+axiom-train     = { path = "../axiom-train" }
+meridian-core   = { path = "../meridian-core" }
+meridian-server = { path = "../meridian-server" }
+meridian-proto  = { path = "../meridian-proto" }
+rand            = "0.8"
+rayon           = "1.10"
+sysinfo         = "0.30"
 
 [[bin]]
 name = "tessera-exp"
 path = "src/bin/tessera_exp.rs"
+
+[[bin]]
+name = "tessera-generate"
+path = "src/bin/tessera_generate.rs"
+
+[[bin]]
+name = "tessera-infer"
+path = "src/bin/tessera_infer.rs"
+
+[[bin]]
+name = "tessera-samardb-bench"
+path = "src/bin/tessera_samardb_bench.rs"
+
+[[bin]]
+name = "tessera-samardb-1m-stress"
+path = "src/bin/tessera_samardb_1m_stress.rs"
+
+[[bin]]
+name = "tessera-meridian-direct-bench"
+path = "src/bin/tessera_meridian_direct_bench.rs"
+
+[[bin]]
+name = "tessera-meridian-scale-ladder"
+path = "src/bin/tessera_meridian_scale_ladder.rs"
+
+[[bin]]
+name = "tessera-inbuilt-meridian-test"
+path = "src/bin/tessera_inbuilt_meridian_test.rs"
+

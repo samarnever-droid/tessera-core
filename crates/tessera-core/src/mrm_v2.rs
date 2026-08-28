@@ -134,6 +134,28 @@ impl MultiResMemoryV2 {
         }
     }
 
+    /// Create a Hardware-Aware Memory Buffer sized to saturate a specific MB budget (e.g. 20MB or 32MB).
+    /// Dynamically computes the maximum fine and coarse slots that fit inside the cache.
+    pub fn new_hardware_adaptive(d: usize, buffer_mb: usize, seed: u64) -> Self {
+        let (k_fine, k_coarse) = Self::compute_optimal_slots(d, buffer_mb);
+        Self::new(d, k_fine, k_coarse, seed)
+    }
+
+    /// Computes the exact number of K_fine and K_coarse token slots for a given Megabyte budget.
+    pub fn compute_optimal_slots(d: usize, buffer_mb: usize) -> (usize, usize) {
+        let target_bytes = buffer_mb * 1024 * 1024;
+        let bytes_per_fine_slot = (d * 2 + 2) * std::mem::size_of::<f32>(); // Key, Val, Salience, Hit counter
+        let bytes_per_coarse_slot = (d * 2) * std::mem::size_of::<f32>();   // Centroid, Val
+        
+        // 80% fine slots, 20% coarse summary centroids
+        let fine_bytes = (target_bytes as f64 * 0.80) as usize;
+        let coarse_bytes = (target_bytes as f64 * 0.20) as usize;
+        
+        let k_fine = (fine_bytes / bytes_per_fine_slot).max(64);
+        let k_coarse = (coarse_bytes / bytes_per_coarse_slot).max(16);
+        (k_fine, k_coarse)
+    }
+
     pub fn param_count(&self) -> usize {
         4 * (self.d * self.d) + self.d
     }
@@ -237,6 +259,12 @@ impl MultiResMemoryV2 {
 
     /// Read from MRM using query vector Q with sharp Cosine Temperature Softmax (tau = 0.05).
     pub fn read_memory(&mut self, query_vec: &[f32], out_context: &mut [f32]) {
+        self.read_memory_const(query_vec, out_context);
+        self.stats.total_reads += 1;
+    }
+
+    /// Pure immutable read from MRM using query vector Q without modifying hit counters.
+    pub fn read_memory_const(&self, query_vec: &[f32], out_context: &mut [f32]) {
         let d = self.d;
         let k_fine = self.num_occupied_slots.max(1);
         let k_total = k_fine + self.k_coarse;
@@ -272,7 +300,6 @@ impl MultiResMemoryV2 {
             if p > 1e-5 {
                 let v_slice = &self.fine_vals[i * d..(i + 1) * d];
                 vec_add_scaled(out_context, v_slice, p);
-                self.fine_hits[i] = self.fine_hits[i] * 0.99 + p; // update LRQ hits
             }
         }
         for c in 0..self.k_coarse {
@@ -282,8 +309,6 @@ impl MultiResMemoryV2 {
                 vec_add_scaled(out_context, v_slice, p);
             }
         }
-
-        self.stats.total_reads += 1;
     }
 
     /// Forward pass over sequence of tokens.
@@ -337,8 +362,130 @@ impl MultiResMemoryV2 {
         }
     }
 
+    /// Analytical Backward Pass for MRM Sequence Processing
+    pub fn backward_sequence(
+        &self,
+        h_in: &[f32],
+        d_out: &[f32],
+        d_in: &mut [f32],
+        grads: &mut MrmV2Grads,
+        seq_len: usize,
+    ) {
+        let d = self.d;
+        let temp = 0.05f32;
+
+        let wq_v = MatrixView::new(&self.w_q, d, d);
+        let wo_v = MatrixView::new(&self.w_o, d, d);
+        let mut gwq = MatrixViewMut::new(&mut grads.grad_wq, d, d);
+        let mut gwk = MatrixViewMut::new(&mut grads.grad_wk, d, d);
+        let mut gwv = MatrixViewMut::new(&mut grads.grad_wv, d, d);
+        let mut gwo = MatrixViewMut::new(&mut grads.grad_wo, d, d);
+
+        let mut q = vec![0.0f32; d];
+        let mut mem_context = vec![0.0f32; d];
+        let mut proj_out = vec![0.0f32; d];
+        let mut d_proj = vec![0.0f32; d];
+        let mut d_ctx = vec![0.0f32; d];
+        let mut d_q = vec![0.0f32; d];
+        let mut tmp_d = vec![0.0f32; d];
+
+        for t in 0..seq_len {
+            let x_t = &h_in[t * d..(t + 1) * d];
+            let dh_out = &d_out[t * d..(t + 1) * d];
+            let dh_in = &mut d_in[t * d..(t + 1) * d];
+
+            // Re-simulate forward at step t
+            matvec(&wq_v, x_t, &mut q);
+            self.read_memory_const(&q, &mut mem_context);
+            matvec(&wo_v, &mem_context, &mut proj_out);
+
+            let gate_raw = dot(x_t, &self.w_gate) - 2.0f32;
+            let gate_sig = 1.0f32 / (1.0f32 + (-gate_raw).exp());
+
+            // 1. Residual + Gate Gradient
+            dh_in.copy_from_slice(dh_out);
+
+            let dot_dh_proj = dot(dh_out, &proj_out);
+            let d_gate_raw = dot_dh_proj * gate_sig * (1.0 - gate_sig);
+
+            for i in 0..d {
+                grads.grad_wgate[i] += d_gate_raw * x_t[i];
+                dh_in[i] += d_gate_raw * self.w_gate[i];
+                d_proj[i] = gate_sig * dh_out[i];
+            }
+
+            // 2. Output Projection Backward
+            outer_product_accumulate(&d_proj, &mem_context, 1.0, &mut gwo);
+            matvec_transposed(&wo_v, &d_proj, &mut d_ctx);
+
+            // 3. Memory Read Softmax Gradient
+            let k_fine = self.num_occupied_slots.max(1);
+            let k_total = k_fine + self.k_coarse;
+            let q_norm = dot(&q, &q).sqrt().max(1e-8);
+
+            let mut scores = vec![0.0f32; k_total];
+            for i in 0..k_fine {
+                let k_slice = &self.fine_keys[i * d..(i + 1) * d];
+                let k_norm = dot(k_slice, k_slice).sqrt().max(1e-8);
+                scores[i] = dot(&q, k_slice) / (q_norm * k_norm * temp);
+            }
+            for c in 0..self.k_coarse {
+                let c_slice = &self.coarse_centroids[c * d..(c + 1) * d];
+                let c_norm = dot(c_slice, c_slice).sqrt().max(1e-8);
+                scores[k_fine + c] = dot(&q, c_slice) / (q_norm * c_norm * temp);
+            }
+
+            let mut probs = vec![0.0f32; k_total];
+            softmax(&scores, &mut probs);
+
+            let mut d_scores = vec![0.0f32; k_total];
+            for i in 0..k_fine {
+                let v_slice = &self.fine_vals[i * d..(i + 1) * d];
+                d_scores[i] = probs[i] * dot(&d_ctx, v_slice);
+            }
+            for c in 0..self.k_coarse {
+                let v_slice = &self.coarse_vals[c * d..(c + 1) * d];
+                d_scores[k_fine + c] = probs[k_fine + c] * dot(&d_ctx, v_slice);
+            }
+
+            let sum_dp: f32 = d_scores.iter().sum();
+            d_q.fill(0.0f32);
+
+            for i in 0..k_fine {
+                let d_s = (d_scores[i] - probs[i] * sum_dp) / temp;
+                let k_slice = &self.fine_keys[i * d..(i + 1) * d];
+                let k_norm = dot(k_slice, k_slice).sqrt().max(1e-8);
+                let cos_sim = dot(&q, k_slice) / (q_norm * k_norm);
+                for c in 0..d {
+                    let grad_cos = (k_slice[c] / (q_norm * k_norm)) - (cos_sim * q[c] / (q_norm * q_norm));
+                    d_q[c] += d_s * grad_cos;
+                }
+            }
+
+            // 4. Query Projection Backward
+            outer_product_accumulate(&d_q, x_t, 1.0, &mut gwq);
+            matvec_transposed(&wq_v, &d_q, &mut tmp_d);
+            vec_add_scaled(dh_in, &tmp_d, 1.0);
+
+            // 5. Key and Value smooth alignment
+            outer_product_accumulate(&d_q, x_t, 0.05, &mut gwk);
+            outer_product_accumulate(&d_ctx, x_t, 0.05, &mut gwv);
+        }
+    }
+
     /// Targeted Needle-in-Haystack Retrieval Probe.
     pub fn probe_needle_recall(&mut self, context_len: usize, seed: u64) -> f32 {
+        self.probe_needle_recall_with_salience(context_len, seed, 100.0, 1.0)
+    }
+
+    /// Targeted Needle-in-Haystack Retrieval Probe with configurable needle and distractor salience.
+    pub fn probe_needle_recall_with_salience(
+        &mut self,
+        context_len: usize,
+        seed: u64,
+        needle_salience: f32,
+        distractor_salience: f32,
+    ) -> f32 {
         let d = self.d;
         let mut rng = StdRng::seed_from_u64(seed);
 
@@ -346,14 +493,13 @@ impl MultiResMemoryV2 {
         let needle_key: Vec<f32> = (0..d).map(|_| rng.gen_range(-1.0..1.0)).collect();
         let needle_val: Vec<f32> = (0..d).map(|_| rng.gen_range(-1.0..1.0)).collect();
 
-        // High salience insertion (needle protection)
-        self.write_token(&needle_key, &needle_val, 100.0);
+        self.write_token(&needle_key, &needle_val, needle_salience);
 
         // 2. Stream distraction tokens
         for _ in 0..context_len {
             let dist_k: Vec<f32> = (0..d).map(|_| rng.gen_range(-1.0..1.0)).collect();
             let dist_v: Vec<f32> = (0..d).map(|_| rng.gen_range(-1.0..1.0)).collect();
-            self.write_token(&dist_k, &dist_v, 1.0);
+            self.write_token(&dist_k, &dist_v, distractor_salience);
         }
 
         // 3. Query memory for needle

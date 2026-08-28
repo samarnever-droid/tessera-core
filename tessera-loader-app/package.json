@@ -1,0 +1,16 @@
+{
+  "name": "tessera-model-loader",
+  "version": "1.0.0",
+  "description": "Universal Tessera Model Loader & Chat App with Inbuilt MRM and Meridian Memory in Bun",
+  "main": "src/server.ts",
+  "scripts": {
+    "dev": "bun --watch src/server.ts",
+    "start": "bun src/server.ts"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

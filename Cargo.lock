@@ -350,6 +350,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "meridian-bench"
+version = "0.1.0"
+dependencies = [
+ "meridian-core",
+ "meridian-proto",
+ "meridian-server",
+ "meridian-sim",
+]
+
+[[package]]
+name = "meridian-bounded"
+version = "0.1.0"
+
+[[package]]
+name = "meridian-core"
+version = "0.1.0"
+dependencies = [
+ "meridian-bounded",
+]
+
+[[package]]
+name = "meridian-proto"
+version = "0.1.0"
+
+[[package]]
+name = "meridian-server"
+version = "0.1.0"
+dependencies = [
+ "meridian-core",
+ "meridian-proto",
+]
+
+[[package]]
+name = "meridian-sim"
+version = "0.1.0"
+
+[[package]]
 name = "mneme-core"
 version = "0.1.0"
 dependencies = [
@@ -651,6 +688,9 @@ dependencies = [
  "axiom-baseline",
  "axiom-core",
  "axiom-train",
+ "meridian-core",
+ "meridian-proto",
+ "meridian-server",
  "rand",
  "rayon",
  "sysinfo",

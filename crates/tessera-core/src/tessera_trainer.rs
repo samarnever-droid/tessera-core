@@ -25,10 +25,15 @@ pub struct StageMoments {
     pub m_w2: Vec<f32>, pub v_w2: Vec<f32>,
     pub m_ad_u: Vec<f32>, pub v_ad_u: Vec<f32>,
     pub m_ad_v: Vec<f32>, pub v_ad_v: Vec<f32>,
+    pub m_mrm_wq: Option<Vec<f32>>, pub v_mrm_wq: Option<Vec<f32>>,
+    pub m_mrm_wk: Option<Vec<f32>>, pub v_mrm_wk: Option<Vec<f32>>,
+    pub m_mrm_wv: Option<Vec<f32>>, pub v_mrm_wv: Option<Vec<f32>>,
+    pub m_mrm_wo: Option<Vec<f32>>, pub v_mrm_wo: Option<Vec<f32>>,
+    pub m_mrm_wgate: Option<Vec<f32>>, pub v_mrm_wgate: Option<Vec<f32>>,
 }
 
 impl StageMoments {
-    pub fn new(d: usize, d_ff: usize, r: usize) -> Self {
+    pub fn new(d: usize, d_ff: usize, r: usize, use_mrm: bool) -> Self {
         Self {
             m_n1: vec![0.0f32; d], v_n1: vec![0.0f32; d],
             m_conv: vec![0.0f32; 4 * d], v_conv: vec![0.0f32; 4 * d],
@@ -45,6 +50,16 @@ impl StageMoments {
             m_w2: vec![0.0f32; d * d_ff], v_w2: vec![0.0f32; d * d_ff],
             m_ad_u: vec![0.0f32; d * r], v_ad_u: vec![0.0f32; d * r],
             m_ad_v: vec![0.0f32; r * d], v_ad_v: vec![0.0f32; r * d],
+            m_mrm_wq: if use_mrm { Some(vec![0.0f32; d * d]) } else { None },
+            v_mrm_wq: if use_mrm { Some(vec![0.0f32; d * d]) } else { None },
+            m_mrm_wk: if use_mrm { Some(vec![0.0f32; d * d]) } else { None },
+            v_mrm_wk: if use_mrm { Some(vec![0.0f32; d * d]) } else { None },
+            m_mrm_wv: if use_mrm { Some(vec![0.0f32; d * d]) } else { None },
+            v_mrm_wv: if use_mrm { Some(vec![0.0f32; d * d]) } else { None },
+            m_mrm_wo: if use_mrm { Some(vec![0.0f32; d * d]) } else { None },
+            v_mrm_wo: if use_mrm { Some(vec![0.0f32; d * d]) } else { None },
+            m_mrm_wgate: if use_mrm { Some(vec![0.0f32; d]) } else { None },
+            v_mrm_wgate: if use_mrm { Some(vec![0.0f32; d]) } else { None },
         }
     }
 }
@@ -67,7 +82,7 @@ pub struct TesseraAdamW {
 impl TesseraAdamW {
     pub fn new(model: &TesseraModel, lr: f32) -> Self {
         let stage_moments = model.stages.iter().map(|s| {
-            StageMoments::new(s.d_model, s.d_ff, s.adapter_rank)
+            StageMoments::new(s.d_model, s.d_ff, s.adapter_rank, s.mrm.is_some())
         }).collect();
 
         Self {
@@ -112,6 +127,13 @@ impl TesseraAdamW {
             for &g in &sg.grad_w2 { sum_sq += g * g; }
             for &g in &sg.grad_adapter_u { sum_sq += g * g; }
             for &g in &sg.grad_adapter_v { sum_sq += g * g; }
+            if let Some(ref mg) = sg.mrm_grads {
+                for &g in &mg.grad_wq { sum_sq += g * g; }
+                for &g in &mg.grad_wk { sum_sq += g * g; }
+                for &g in &mg.grad_wv { sum_sq += g * g; }
+                for &g in &mg.grad_wo { sum_sq += g * g; }
+                for &g in &mg.grad_wgate { sum_sq += g * g; }
+            }
         }
         sum_sq.sqrt()
     }
@@ -172,6 +194,27 @@ impl TesseraAdamW {
             update_p(&mut stage.w2, &s_grads.grad_w2, &mut sm.m_w2, &mut sm.v_w2);
             update_p(&mut stage.adapter_u, &s_grads.grad_adapter_u, &mut sm.m_ad_u, &mut sm.v_ad_u);
             update_p(&mut stage.adapter_v, &s_grads.grad_adapter_v, &mut sm.m_ad_v, &mut sm.v_ad_v);
+
+            if let (Some(ref mut mrm), Some(ref s_mrm_grads), Some(ref mut m_wq), Some(ref mut v_wq), Some(ref mut m_wk), Some(ref mut v_wk), Some(ref mut m_wv), Some(ref mut v_wv), Some(ref mut m_wo), Some(ref mut v_wo), Some(ref mut m_wg), Some(ref mut v_wg)) = (
+                &mut stage.mrm,
+                &s_grads.mrm_grads,
+                &mut sm.m_mrm_wq,
+                &mut sm.v_mrm_wq,
+                &mut sm.m_mrm_wk,
+                &mut sm.v_mrm_wk,
+                &mut sm.m_mrm_wv,
+                &mut sm.v_mrm_wv,
+                &mut sm.m_mrm_wo,
+                &mut sm.v_mrm_wo,
+                &mut sm.m_mrm_wgate,
+                &mut sm.v_mrm_wgate,
+            ) {
+                update_p(&mut mrm.w_q, &s_mrm_grads.grad_wq, m_wq, v_wq);
+                update_p(&mut mrm.w_k, &s_mrm_grads.grad_wk, m_wk, v_wk);
+                update_p(&mut mrm.w_v, &s_mrm_grads.grad_wv, m_wv, v_wv);
+                update_p(&mut mrm.w_o, &s_mrm_grads.grad_wo, m_wo, v_wo);
+                update_p(&mut mrm.w_gate, &s_mrm_grads.grad_wgate, m_wg, v_wg);
+            }
         }
     }
 }
@@ -304,6 +347,13 @@ pub fn train_tessera(
             axiom_core::tensor::vec_scale(&mut sg.grad_w2, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_adapter_u, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_adapter_v, scale);
+            if let Some(ref mut mg) = sg.mrm_grads {
+                axiom_core::tensor::vec_scale(&mut mg.grad_wq, scale);
+                axiom_core::tensor::vec_scale(&mut mg.grad_wk, scale);
+                axiom_core::tensor::vec_scale(&mut mg.grad_wv, scale);
+                axiom_core::tensor::vec_scale(&mut mg.grad_wo, scale);
+                axiom_core::tensor::vec_scale(&mut mg.grad_wgate, scale);
+            }
         }
 
         // Warmup-Stable-Decay (WSD): Warmup (1..10) -> Stable Plateau (11..90) -> Cooldown Annealing (91..120)

@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Tessera Real Model Loader & Meridian UI</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/style.css">
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col font-sans selection:bg-indigo-500 selection:text-white">
+
+  <!-- Top Header Navigation -->
+  <header class="border-b border-slate-800/80 bg-slate-900/70 backdrop-blur-md sticky top-0 z-40 px-6 py-3.5 flex flex-wrap items-center justify-between gap-4">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-cyan-400 flex items-center justify-center shadow-lg shadow-indigo-500/20">
+        <i data-lucide="cpu" class="w-5 h-5 text-white"></i>
+      </div>
+      <div>
+        <div class="flex items-center gap-2">
+          <h1 class="font-bold text-base tracking-tight text-white">Tessera Real Model Loader</h1>
+          <span class="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Real Neural Engine</span>
+        </div>
+        <p class="text-xs text-slate-400">Bun Runtime • @huggingface/transformers • Inbuilt MRM</p>
+      </div>
+    </div>
+
+    <!-- Model Selector & Actions -->
+    <div class="flex items-center gap-3 flex-wrap">
+      <!-- Real Model Dropdown -->
+      <div class="flex items-center gap-2">
+        <select id="model-select" onchange="onModelSelectChange()" class="bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-1.5 focus:outline-none focus:border-indigo-500">
+          <option value="onnx-community/Qwen2.5-0.5B-Instruct">Qwen 2.5 - 0.5B Instruct (ONNX 350MB)</option>
+          <option value="onnx-community/Llama-3.2-1B-Instruct">Llama 3.2 - 1B Instruct (ONNX 780MB)</option>
+          <option value="Xenova/Qwen1.5-0.5B-Chat">Qwen 1.5 - 0.5B Chat (ONNX 410MB)</option>
+          <option value="custom">⚙️ Custom HuggingFace / Local Repo</option>
+        </select>
+        <button id="load-model-btn" onclick="loadSelectedModel()" class="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-medium text-xs shadow-sm flex items-center gap-1.5">
+          <i data-lucide="download" class="w-3.5 h-3.5"></i>
+          <span>Load</span>
+        </button>
+      </div>
+
+      <!-- Memory Telemetry Stats Pill -->
+      <div id="memory-pill" class="hidden sm:flex items-center gap-2.5 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs text-slate-300">
+        <div class="flex items-center gap-1.5 text-cyan-400">
+          <i data-lucide="database" class="w-3.5 h-3.5"></i>
+          <span id="stat-chunks" class="font-semibold text-slate-100">0</span> chunks
+        </div>
+        <span class="text-slate-700">|</span>
+        <div class="flex items-center gap-1.5 text-indigo-400">
+          <i data-lucide="file-text" class="w-3.5 h-3.5"></i>
+          <span id="stat-words" class="font-semibold text-slate-100">0</span> words
+        </div>
+      </div>
+
+      <!-- Action Buttons -->
+      <button onclick="openChunkModal()" class="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors border border-slate-700/60" title="Inspect Memory Chunks">
+        <i data-lucide="layers" class="w-4 h-4"></i>
+      </button>
+      <button onclick="clearMemory()" class="p-2 rounded-lg bg-slate-800 hover:bg-red-500/20 hover:text-red-400 text-slate-400 transition-colors border border-slate-700/60" title="Wipe Memory">
+        <i data-lucide="trash-2" class="w-4 h-4"></i>
+      </button>
+    </div>
+  </header>
+
+  <!-- Live Model Loading Progress Bar (Hidden by default) -->
+  <div id="download-progress-bar" class="hidden bg-indigo-950/80 border-b border-indigo-500/30 px-6 py-2 text-xs">
+    <div class="flex items-center justify-between mb-1">
+      <span id="download-status-text" class="text-indigo-200 font-medium flex items-center gap-2">
+        <i data-lucide="loader-2" class="w-3.5 h-3.5 animate-spin text-indigo-400"></i>
+        <span>Downloading model weights into local cache...</span>
+      </span>
+      <span id="download-percent" class="font-mono text-cyan-300 font-semibold">0%</span>
+    </div>
+    <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+      <div id="download-progress-fill" class="bg-gradient-to-r from-indigo-500 to-cyan-400 h-1.5 rounded-full transition-all duration-150" style="width: 0%"></div>
+    </div>
+  </div>
+
+  <!-- Custom Model ID Input Modal / Bar -->
+  <div id="custom-model-bar" class="hidden bg-slate-900 border-b border-slate-800 px-6 py-2 flex items-center gap-3 text-xs">
+    <span class="text-slate-400">HuggingFace Repo ID or Local Path:</span>
+    <input id="custom-model-input" type="text" placeholder="e.g. onnx-community/Qwen2.5-0.5B-Instruct" class="flex-1 bg-slate-950 border border-slate-700 rounded-md px-3 py-1 text-slate-100 focus:outline-none focus:border-indigo-500 font-mono text-xs">
+    <button onclick="loadCustomModel()" class="px-3 py-1 rounded-md bg-indigo-600 hover:bg-indigo-500 text-white font-medium">Load Custom</button>
+  </div>
+
+  <!-- Active Model Specs Banner -->
+  <div id="model-banner" class="bg-slate-900/40 border-b border-slate-800/60 px-6 py-2 flex items-center justify-between text-xs text-slate-400">
+    <div class="flex items-center gap-4 flex-wrap">
+      <span class="flex items-center gap-1.5 text-slate-300">
+        <span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+        <strong id="banner-model-name" class="font-medium text-white">Qwen 2.5 - 0.5B Instruct</strong>
+      </span>
+      <span>Precision: <strong id="banner-precision" class="text-slate-300">q4 (Quantized)</strong></span>
+      <span>Size: <strong id="banner-vram" class="text-slate-300">350 MB</strong></span>
+      <span>Params: <strong id="banner-params" class="text-slate-300">490M</strong></span>
+    </div>
+    <span class="text-[11px] text-emerald-400 font-mono">Real Transformers Inference Active</span>
+  </div>
+
+  <!-- Main Chat Window Area -->
+  <main class="flex-1 max-w-5xl w-full mx-auto p-4 sm:p-6 flex flex-col justify-between overflow-hidden">
+    
+    <!-- Message History Container -->
+    <div id="chat-container" class="flex-1 overflow-y-auto space-y-6 pr-2 mb-4 scrollbar-thin">
+      
+      <!-- Welcome Hero Message -->
+      <div class="bg-gradient-to-b from-slate-900 to-slate-900/60 border border-slate-800 rounded-2xl p-6 shadow-xl">
+        <div class="flex items-start gap-4">
+          <div class="p-3 rounded-xl bg-indigo-600/10 border border-indigo-500/20 text-indigo-400">
+            <i data-lucide="sparkles" class="w-6 h-6"></i>
+          </div>
+          <div>
+            <h2 class="text-base font-semibold text-white mb-1">Real Neural Engine Ready in Bun</h2>
+            <p class="text-xs sm:text-sm text-slate-400 leading-relaxed mb-3">
+              Running real neural models via <strong>@huggingface/transformers</strong> with <strong>Meridian Long-Term Vector Memory</strong>. 
+              Paste entire books or codebases. The UI automatically virtualizes long prompts with 
+              <strong>"See More"</strong> cards so browser memory never lags.
+            </p>
+            <div class="flex flex-wrap gap-2 text-xs">
+              <button onclick="insertSampleQuery('who is villan in the manuscript?')" class="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors">
+                🔍 "Who is villain?"
+              </button>
+              <button onclick="insertSampleQuery('what was the truth behind the Magree Incident?')" class="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors">
+                🌌 "Magree Incident"
+              </button>
+              <button onclick="insertSampleQuery('explain Anne Kades sacrifice and the ending')" class="px-3 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 transition-colors">
+                📖 "Anne Kade's Ending"
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Bottom Input Composer -->
+    <div class="mt-auto pt-2">
+      <div class="relative bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl focus-within:border-indigo-500/80 focus-within:ring-1 focus-within:ring-indigo-500/30 transition-all">
+        
+        <textarea 
+          id="prompt-input" 
+          rows="3" 
+          placeholder="Ask a question or paste full novel / code (auto-chunked with 'See More' collapse)..."
+          class="w-full bg-transparent px-4 pt-3.5 pb-12 text-sm text-slate-100 placeholder-slate-500 focus:outline-none resize-none scrollbar-none"
+        ></textarea>
+
+        <!-- Action Bar at Bottom of Input Area -->
+        <div class="absolute bottom-2.5 left-4 right-3 flex items-center justify-between">
+          <div class="flex items-center gap-2 text-xs text-slate-500">
+            <span id="char-counter">0 chars</span>
+            <span class="text-slate-700">•</span>
+            <span id="word-counter">0 words</span>
+          </div>
+
+          <div class="flex items-center gap-2">
+            <button 
+              id="send-btn" 
+              onclick="handleSend()" 
+              class="px-4 py-2 rounded-xl bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white text-xs font-semibold flex items-center gap-1.5 shadow-lg shadow-indigo-600/30 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <span>Send</span>
+              <i data-lucide="arrow-up" class="w-3.5 h-3.5"></i>
+            </button>
+          </div>
+        </div>
+      </div>
+      <p class="text-[11px] text-center text-slate-500 mt-2">
+        Tessera Real Engine • Bun Runtime • Inbuilt Meridian Vector Memory
+      </p>
+    </div>
+
+  </main>
+
+  <!-- Chunk Virtualizer Inspector Modal -->
+  <div id="chunk-modal" class="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm hidden flex items-center justify-center p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl max-w-3xl w-full max-h-[85vh] flex flex-col shadow-2xl">
+      <div class="p-5 border-b border-slate-800 flex items-center justify-between">
+        <div class="flex items-center gap-2.5">
+          <i data-lucide="database" class="w-5 h-5 text-indigo-400"></i>
+          <div>
+            <h3 class="font-semibold text-white text-sm">Meridian Memory Index</h3>
+            <p class="text-xs text-slate-400">Virtual In-Memory Chunks & BM25 Postings</p>
+          </div>
+        </div>
+        <button onclick="closeChunkModal()" class="p-1.5 rounded-lg hover:bg-slate-800 text-slate-400 hover:text-white">
+          <i data-lucide="x" class="w-4 h-4"></i>
+        </button>
+      </div>
+
+      <!-- Chunk List Area -->
+      <div id="chunk-modal-body" class="p-5 overflow-y-auto space-y-3 flex-1 text-xs">
+        <p class="text-slate-500 text-center py-8">No chunks currently stored in Meridian Memory. Paste a document to index it.</p>
+      </div>
+
+      <div class="p-4 border-t border-slate-800 bg-slate-900/60 flex items-center justify-between text-xs text-slate-400">
+        <span id="modal-footer-stats">0 chunks indexed</span>
+        <button onclick="closeChunkModal()" class="px-4 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-white font-medium">
+          Close
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

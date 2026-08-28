@@ -10,8 +10,19 @@ members = [
     "crates/forge-core",
     "crates/mneme-core",
     "crates/tessera-core",
+    "crates/meridian-core",
+    "crates/meridian-server",
+    "crates/meridian-proto",
+    "crates/meridian-bounded",
+    "crates/meridian-sim",
+    "crates/meridian-bench",
 ]
 resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
 
 [profile.release]
 opt-level = 3

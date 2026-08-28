@@ -656,7 +656,7 @@ impl GriffinAdamW {
         let inv_bc1 = 1.0f32 / bc1;
         let inv_bc2 = 1.0f32 / bc2;
 
-        let mut update_p = |p: &mut [f32], g: &[f32], m: &mut [f32], v: &mut [f32]| {
+        let update_p = |p: &mut [f32], g: &[f32], m: &mut [f32], v: &mut [f32]| {
             for (((param, &grad), m_val), v_val) in p.iter_mut().zip(g.iter()).zip(m.iter_mut()).zip(v.iter_mut()) {
                 *m_val = self.beta1 * *m_val + (1.0 - self.beta1) * grad;
                 *v_val = self.beta2 * *v_val + (1.0 - self.beta2) * grad * grad;

@@ -1,0 +1,12 @@
+[package]
+name = "meridian-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+meridian-core = { path = "../meridian-core" }
+meridian-proto = { path = "../meridian-proto" }
+meridian-server = { path = "../meridian-server" }
+meridian-sim = { path = "../meridian-sim" }
+

@@ -8,6 +8,8 @@ pub mod exp_tessera_suite;
 pub mod griffin;
 pub mod exp_griffin_benchmark;
 pub mod exp_standalone;
+pub mod samardb_vector;
+pub mod tessera_meridian_engine;
 
 pub use mrm_v2::*;
 pub use tessera_model::*;
@@ -17,3 +19,5 @@ pub use exp_tessera_suite::*;
 pub use griffin::*;
 pub use exp_griffin_benchmark::*;
 pub use exp_standalone::*;
+pub use samardb_vector::*;
+pub use tessera_meridian_engine::*;

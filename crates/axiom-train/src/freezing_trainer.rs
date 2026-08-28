@@ -166,11 +166,11 @@ pub fn run_freezing_diagnostic(
 
         // Aggregate gradients for Layer 2 only
         let mut total_l2_grads = axiom_model::layer::LayerGrads::new(&config);
-        let mut batch_loss = 0.0f32;
+        let mut _batch_loss = 0.0f32;
         let scale = 1.0f32 / (batch_size * seq_len) as f32;
 
         for (lp, lg) in thread_results {
-            batch_loss += lp;
+            _batch_loss += lp;
             total_l2_grads.add(&lg);
         }
 

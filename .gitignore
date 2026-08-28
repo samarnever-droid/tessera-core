@@ -5,3 +5,9 @@
 /data/enwik8.zip
 /vendor/recurrentgemma/.git
 *.pyc
+node_modules/
+**/node_modules/
+*.bin
+.cache/
+**/.cache/
+*.onnx
