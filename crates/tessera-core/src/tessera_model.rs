@@ -169,7 +169,7 @@ pub struct TesseraStageGrads {
     pub grad_w_conv: Vec<f32>,      // (4 x d)
     pub grad_w_gate_attn: Vec<f32>, // (d x d) Gated Temporal Unit
     pub grad_lambda_diff: Vec<f32>, // (2) Differential Attention Lambda
-    pub grad_eta_rope: Vec<f32>,    // (16) Adaptive RoPE Band Multipliers
+    pub grad_eta_rope: Vec<f32>,    // (d_k/2) Adaptive RoPE Band Multipliers, sized dynamically
     pub grad_wq: Vec<f32>,
     pub grad_wk: Vec<f32>,
     pub grad_wv: Vec<f32>,
@@ -184,13 +184,13 @@ pub struct TesseraStageGrads {
 }
 
 impl TesseraStageGrads {
-    pub fn new(d: usize, d_ff: usize, r: usize, use_mrm: bool) -> Self {
+    pub fn new(d: usize, d_ff: usize, r: usize, use_mrm: bool, eta_len: usize) -> Self {
         Self {
             grad_norm1_gamma: vec![0.0f32; d],
             grad_w_conv: vec![0.0f32; 4 * d],
             grad_w_gate_attn: vec![0.0f32; d * d],
             grad_lambda_diff: vec![0.0f32; 2],
-            grad_eta_rope: vec![0.0f32; 16],
+            grad_eta_rope: vec![0.0f32; eta_len],
             grad_wq: vec![0.0f32; d * d],
             grad_wk: vec![0.0f32; d * d],
             grad_wv: vec![0.0f32; d * d],
@@ -257,7 +257,7 @@ pub struct TesseraStage {
     pub w_conv: Vec<f32>,      // (4 x d) Depthwise Causal 1D Convolution
     pub w_gate_attn: Vec<f32>, // (d x d) Gated Temporal Unit
     pub lambda_diff: Vec<f32>, // (2) Differential Attention noise cancellation lambda
-    pub eta_rope: Vec<f32>,    // (16) Adaptive RoPE Multipliers
+    pub eta_rope: Vec<f32>,    // (d_k/2) Adaptive RoPE Multipliers, sized dynamically as d_model/(2*n_heads)
     pub wq: Vec<f32>,
     pub wk: Vec<f32>,
     pub wv: Vec<f32>,
@@ -300,7 +300,12 @@ impl TesseraStage {
 
         let w_gate_attn = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let lambda_diff = vec![0.8f32; 2]; // Initialized to standard Diff-Transformer lambda = 0.8
-        let eta_rope = vec![0.0f32; 16];   // Initialized to 0.0 (2*sig(0)=1.0)
+        // eta_rope length = d_k/2 (half the per-head rotary dimension), NOT a fixed constant.
+        // This must scale with d_model/n_heads or apply_adaptive_rope will index out of bounds
+        // for any (d_model, n_heads) pair where d_k/2 != 16 (e.g. scaled-up configs).
+        let d_k = d_model / n_heads.max(1);
+        let eta_len = (d_k / 2).max(1);
+        let eta_rope = vec![0.0f32; eta_len];   // Initialized to 0.0 (2*sig(0)=1.0)
         let wq = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let wk = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
         let wv = (0..d_model * d_model).map(|_| rng.gen_range(-scale_d..scale_d)).collect();
@@ -350,6 +355,7 @@ impl TesseraStage {
         let gate = self.d_model * self.d_model;
         let lambda = self.lambda_diff.len();
         let eta = self.eta_rope.len();
+        let _ = eta; // silence unused warning if eta ever folded elsewhere
         let attn = 4 * (self.d_model * self.d_model);
         let dense = 2 * (self.d_ff * self.d_model) + (self.d_model * self.d_ff);
         let adapter = 2 * (self.d_model * self.adapter_rank);
@@ -372,7 +378,7 @@ impl TesseraModelGrads {
         Self {
             grad_embed: vec![0.0f32; vocab_size * d_model],
             stage_grads: stages.iter().map(|s| {
-                TesseraStageGrads::new(d_model, s.d_ff, s.adapter_rank, s.mrm.is_some())
+                TesseraStageGrads::new(d_model, s.d_ff, s.adapter_rank, s.mrm.is_some(), s.eta_rope.len())
             }).collect(),
             grad_final_norm_gamma: vec![0.0f32; d_model],
             grad_w_mtp_proj: vec![0.0f32; d_model * d_model],
@@ -468,6 +474,8 @@ impl TesseraModel {
         f.write_all(&(self.d_model as u32).to_le_bytes())?;
         f.write_all(&(self.config.d_ff as u32).to_le_bytes())?;
         f.write_all(&(self.stages.len() as u32).to_le_bytes())?;
+        f.write_all(&(self.config.n_heads as u32).to_le_bytes())?;
+        f.write_all(&(self.config.adapter_rank as u32).to_le_bytes())?;
 
         fn write_floats(f: &mut File, slice: &[f32]) -> std::io::Result<()> {
             let byte_slice = unsafe {
@@ -503,12 +511,14 @@ impl TesseraModel {
         use std::io::Read;
         let mut f = File::open(path)?;
 
-        let mut header = [0u8; 16];
+        let mut header = [0u8; 24];
         f.read_exact(&mut header)?;
         let vocab_size = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
         let d_model = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
         let d_ff = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
         let n_stages = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+        let n_heads = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+        let adapter_rank = u32::from_le_bytes(header[20..24].try_into().unwrap()) as usize;
 
         fn read_floats(f: &mut File, count: usize) -> std::io::Result<Vec<f32>> {
             let mut vec = vec![0.0f32; count];
@@ -525,6 +535,11 @@ impl TesseraModel {
         config.d_model = d_model;
         config.d_ff = d_ff;
         config.n_stages = n_stages;
+        config.n_heads = n_heads;
+        config.adapter_rank = adapter_rank;
+
+        let d_k = d_model / n_heads.max(1);
+        let eta_len = (d_k / 2).max(1);
 
         let mut stages = Vec::with_capacity(n_stages);
         for p in 0..n_stages {
@@ -532,7 +547,7 @@ impl TesseraModel {
             let w_conv = read_floats(&mut f, 4 * d_model)?;
             let w_gate_attn = read_floats(&mut f, d_model * d_model)?;
             let lambda_diff = read_floats(&mut f, 2)?;
-            let eta_rope = read_floats(&mut f, 16)?;
+            let eta_rope = read_floats(&mut f, eta_len)?;
             let wq = read_floats(&mut f, d_model * d_model)?;
             let wk = read_floats(&mut f, d_model * d_model)?;
             let wv = read_floats(&mut f, d_model * d_model)?;
