@@ -72,6 +72,24 @@ impl MrmV2Grads {
     }
 }
 
+/// A point-in-time snapshot of the parts of MRM's memory state that the causal read at
+/// timestep `t` actually observed, captured BEFORE that timestep's own write mutates the
+/// store. `forward_sequence` records one of these per timestep; `backward_sequence` reads
+/// from the recorded snapshot for step `t` instead of from `self`'s FINAL post-sequence
+/// state, which would otherwise be contaminated by every write that happened after `t`
+/// (see TESSERA_DEEP_RESEARCH_PROMPT.md finding W1 / F1 for the full analysis of why this
+/// matters: within a single forward_sequence call, self is mutated in-place by every
+/// write_token call, so a backward pass that "re-simulates" reads against self AFTER the
+/// full forward loop has finished is scoring every timestep against the wrong memory state).
+#[derive(Debug, Clone)]
+pub struct MrmSnapshot {
+    pub fine_keys: Vec<f32>,        // (occupied x d) — only the slots that existed at time t
+    pub fine_vals: Vec<f32>,        // (occupied x d)
+    pub occupied: usize,            // num_occupied_slots as it was at time t
+    pub coarse_centroids: Vec<f32>, // (k_coarse x d) — coarse EMA state drifts on every write
+    pub coarse_vals: Vec<f32>,      // (k_coarse x d)
+}
+
 /// Multi-Resolution Memory (MRM) with Adaptive Multi-Tier Deduplication & LRQ Eviction Policy.
 #[derive(Debug, Clone)]
 pub struct MultiResMemoryV2 {
@@ -93,6 +111,12 @@ pub struct MultiResMemoryV2 {
     pub coarse_vals: Vec<f32>,     // (k_coarse x d)
     pub num_occupied_slots: usize,
     pub stats: MrmV2Stats,
+    /// Per-timestep pre-write memory snapshots recorded by the most recent forward_sequence
+    /// call. Cleared and repopulated at the start of every forward_sequence call. Consumed by
+    /// backward_sequence (called on this same object immediately afterward within one
+    /// forward_backward_sequence invocation) to recompute each timestep's read gradient
+    /// against the memory state that timestep actually saw, not the final post-sequence state.
+    pub snapshots: Vec<MrmSnapshot>,
 }
 
 impl MultiResMemoryV2 {
@@ -131,6 +155,7 @@ impl MultiResMemoryV2 {
             coarse_vals,
             num_occupied_slots: 0,
             stats: MrmV2Stats::new(k_fine, k_coarse),
+            snapshots: Vec::new(),
         }
     }
 
@@ -312,6 +337,15 @@ impl MultiResMemoryV2 {
     }
 
     /// Forward pass over sequence of tokens.
+    ///
+    /// Records a pre-write `MrmSnapshot` for every timestep BEFORE that timestep's
+    /// write_token call mutates fine_keys/fine_vals/coarse_centroids/coarse_vals. This is
+    /// what `backward_sequence` must read from afterward — see the `snapshots` field doc
+    /// comment and `MrmSnapshot` for why re-reading `self`'s final state in backward is
+    /// wrong. `self.snapshots` is cleared and refilled every call, so only the most recent
+    /// forward_sequence's snapshots are ever retained (matches how this module is actually
+    /// used: one forward_sequence call immediately followed by one backward_sequence call
+    /// on the same object, per stage, per training step).
     pub fn forward_sequence(
         &mut self,
         h_in: &[f32],
@@ -336,12 +370,27 @@ impl MultiResMemoryV2 {
         let mut mem_context = vec![0.0f32; d];
         let mut proj_out = vec![0.0f32; d];
 
+        self.snapshots.clear();
+        self.snapshots.reserve(seq_len);
+
         for t in 0..seq_len {
             let x_t = &h_in[t * d..(t + 1) * d];
 
             matvec(&wq_v, x_t, &mut q);
             matvec(&wk_v, x_t, &mut k);
             matvec(&wv_v, x_t, &mut v);
+
+            // Snapshot memory state as it exists RIGHT NOW, i.e. before this timestep's
+            // write below. This is exactly the state read_memory (called next) observes,
+            // so backward_sequence can later recompute the same read deterministically.
+            let occ = self.num_occupied_slots;
+            self.snapshots.push(MrmSnapshot {
+                fine_keys: self.fine_keys[..occ * d].to_vec(),
+                fine_vals: self.fine_vals[..occ * d].to_vec(),
+                occupied: occ,
+                coarse_centroids: self.coarse_centroids.clone(),
+                coarse_vals: self.coarse_vals.clone(),
+            });
 
             // Read existing memory
             self.read_memory(&q, &mut mem_context);
@@ -362,7 +411,74 @@ impl MultiResMemoryV2 {
         }
     }
 
-    /// Analytical Backward Pass for MRM Sequence Processing
+    /// Pure immutable read against a specific point-in-time `MrmSnapshot`, as opposed to
+    /// `read_memory_const` which always reads `self`'s CURRENT (i.e. FINAL post-sequence)
+    /// state. This is what `backward_sequence` must use to correctly recompute the read
+    /// that timestep `t` actually performed — fixes the W1/F1 temporal-contamination bug.
+    fn read_memory_from_snapshot(
+        &self,
+        snapshot: &MrmSnapshot,
+        query_vec: &[f32],
+        out_context: &mut [f32],
+    ) {
+        let d = self.d;
+        let k_fine = snapshot.occupied.max(1);
+        let k_total = k_fine + self.k_coarse;
+        let q_norm = dot(query_vec, query_vec).sqrt().max(1e-8);
+        let temp = 0.05f32;
+        let zero_slot = vec![0.0f32; d];
+
+        let mut scores = vec![0.0f32; k_total];
+        for i in 0..k_fine {
+            let k_slice: &[f32] = if i < snapshot.occupied {
+                &snapshot.fine_keys[i * d..(i + 1) * d]
+            } else {
+                &zero_slot
+            };
+            let k_norm = dot(k_slice, k_slice).sqrt().max(1e-8);
+            let cos_sim = dot(query_vec, k_slice) / (q_norm * k_norm);
+            scores[i] = cos_sim / temp;
+        }
+        for c in 0..self.k_coarse {
+            let c_slice = &snapshot.coarse_centroids[c * d..(c + 1) * d];
+            let c_norm = dot(c_slice, c_slice).sqrt().max(1e-8);
+            let cos_sim = dot(query_vec, c_slice) / (q_norm * c_norm);
+            scores[k_fine + c] = cos_sim / temp;
+        }
+
+        let mut probs = vec![0.0f32; k_total];
+        softmax(&scores, &mut probs);
+
+        out_context.fill(0.0f32);
+        for i in 0..k_fine {
+            let p = probs[i];
+            if p > 1e-5 {
+                let v_slice: &[f32] = if i < snapshot.occupied {
+                    &snapshot.fine_vals[i * d..(i + 1) * d]
+                } else {
+                    &zero_slot
+                };
+                vec_add_scaled(out_context, v_slice, p);
+            }
+        }
+        for c in 0..self.k_coarse {
+            let p = probs[k_fine + c];
+            if p > 1e-5 {
+                let v_slice = &snapshot.coarse_vals[c * d..(c + 1) * d];
+                vec_add_scaled(out_context, v_slice, p);
+            }
+        }
+    }
+
+    /// Analytical Backward Pass for MRM Sequence Processing.
+    ///
+    /// FIX (W1/F1): every per-timestep read is re-simulated and scored against
+    /// `self.snapshots[t]` — the memory state that timestep `t` actually observed during
+    /// `forward_sequence` — instead of against `self`'s live/final fields, which by the
+    /// time this function runs hold the state AFTER every write in the whole sequence.
+    /// Requires `forward_sequence` to have been called on this exact object immediately
+    /// before this call, with the same `seq_len` (that is how `forward_backward_sequence`
+    /// in tessera_model.rs already uses this module).
     pub fn backward_sequence(
         &self,
         h_in: &[f32],
@@ -373,6 +489,16 @@ impl MultiResMemoryV2 {
     ) {
         let d = self.d;
         let temp = 0.05f32;
+
+        assert_eq!(
+            self.snapshots.len(),
+            seq_len,
+            "MRM backward_sequence: snapshots.len() ({}) != seq_len ({}); forward_sequence \
+             must be called on this exact object immediately before backward_sequence, with \
+             the same seq_len, so that per-timestep memory snapshots are available",
+            self.snapshots.len(),
+            seq_len
+        );
 
         let wq_v = MatrixView::new(&self.w_q, d, d);
         let wo_v = MatrixView::new(&self.w_o, d, d);
@@ -388,15 +514,18 @@ impl MultiResMemoryV2 {
         let mut d_ctx = vec![0.0f32; d];
         let mut d_q = vec![0.0f32; d];
         let mut tmp_d = vec![0.0f32; d];
+        let zero_slot = vec![0.0f32; d];
 
         for t in 0..seq_len {
             let x_t = &h_in[t * d..(t + 1) * d];
             let dh_out = &d_out[t * d..(t + 1) * d];
             let dh_in = &mut d_in[t * d..(t + 1) * d];
+            let snapshot = &self.snapshots[t];
 
-            // Re-simulate forward at step t
+            // Re-simulate forward at step t AGAINST THE SNAPSHOT for step t, not against
+            // self's final post-sequence state.
             matvec(&wq_v, x_t, &mut q);
-            self.read_memory_const(&q, &mut mem_context);
+            self.read_memory_from_snapshot(snapshot, &q, &mut mem_context);
             matvec(&wo_v, &mem_context, &mut proj_out);
 
             let gate_raw = dot(x_t, &self.w_gate) - 2.0f32;
@@ -418,19 +547,23 @@ impl MultiResMemoryV2 {
             outer_product_accumulate(&d_proj, &mem_context, 1.0, &mut gwo);
             matvec_transposed(&wo_v, &d_proj, &mut d_ctx);
 
-            // 3. Memory Read Softmax Gradient
-            let k_fine = self.num_occupied_slots.max(1);
+            // 3. Memory Read Softmax Gradient (scored against the SAME snapshot used above)
+            let k_fine = snapshot.occupied.max(1);
             let k_total = k_fine + self.k_coarse;
             let q_norm = dot(&q, &q).sqrt().max(1e-8);
 
             let mut scores = vec![0.0f32; k_total];
             for i in 0..k_fine {
-                let k_slice = &self.fine_keys[i * d..(i + 1) * d];
+                let k_slice: &[f32] = if i < snapshot.occupied {
+                    &snapshot.fine_keys[i * d..(i + 1) * d]
+                } else {
+                    &zero_slot
+                };
                 let k_norm = dot(k_slice, k_slice).sqrt().max(1e-8);
                 scores[i] = dot(&q, k_slice) / (q_norm * k_norm * temp);
             }
             for c in 0..self.k_coarse {
-                let c_slice = &self.coarse_centroids[c * d..(c + 1) * d];
+                let c_slice = &snapshot.coarse_centroids[c * d..(c + 1) * d];
                 let c_norm = dot(c_slice, c_slice).sqrt().max(1e-8);
                 scores[k_fine + c] = dot(&q, c_slice) / (q_norm * c_norm * temp);
             }
@@ -440,11 +573,15 @@ impl MultiResMemoryV2 {
 
             let mut d_scores = vec![0.0f32; k_total];
             for i in 0..k_fine {
-                let v_slice = &self.fine_vals[i * d..(i + 1) * d];
+                let v_slice: &[f32] = if i < snapshot.occupied {
+                    &snapshot.fine_vals[i * d..(i + 1) * d]
+                } else {
+                    &zero_slot
+                };
                 d_scores[i] = probs[i] * dot(&d_ctx, v_slice);
             }
             for c in 0..self.k_coarse {
-                let v_slice = &self.coarse_vals[c * d..(c + 1) * d];
+                let v_slice = &snapshot.coarse_vals[c * d..(c + 1) * d];
                 d_scores[k_fine + c] = probs[k_fine + c] * dot(&d_ctx, v_slice);
             }
 
@@ -453,11 +590,32 @@ impl MultiResMemoryV2 {
 
             for i in 0..k_fine {
                 let d_s = (d_scores[i] - probs[i] * sum_dp) / temp;
-                let k_slice = &self.fine_keys[i * d..(i + 1) * d];
+                let k_slice: &[f32] = if i < snapshot.occupied {
+                    &snapshot.fine_keys[i * d..(i + 1) * d]
+                } else {
+                    &zero_slot
+                };
                 let k_norm = dot(k_slice, k_slice).sqrt().max(1e-8);
                 let cos_sim = dot(&q, k_slice) / (q_norm * k_norm);
                 for c in 0..d {
                     let grad_cos = (k_slice[c] / (q_norm * k_norm)) - (cos_sim * q[c] / (q_norm * q_norm));
+                    d_q[c] += d_s * grad_cos;
+                }
+            }
+            // BUGFIX (found via finite-difference gradient check): the softmax scores
+            // include the coarse-centroid slots (`scores[k_fine + c]` above), so `q`'s
+            // gradient must also receive the coarse-centroid cosine-similarity term.
+            // The original code only walked fine slots here, silently dropping the
+            // coarse contribution to d_q whenever k_coarse > 0 (which it always is by
+            // construction) -- this was a real missing-gradient bug, not just a test
+            // artifact of a separate stateful-forward-pass issue found alongside it.
+            for c_idx in 0..self.k_coarse {
+                let d_s = (d_scores[k_fine + c_idx] - probs[k_fine + c_idx] * sum_dp) / temp;
+                let c_slice = &snapshot.coarse_centroids[c_idx * d..(c_idx + 1) * d];
+                let c_norm = dot(c_slice, c_slice).sqrt().max(1e-8);
+                let cos_sim = dot(&q, c_slice) / (q_norm * c_norm);
+                for c in 0..d {
+                    let grad_cos = (c_slice[c] / (q_norm * c_norm)) - (cos_sim * q[c] / (q_norm * q_norm));
                     d_q[c] += d_s * grad_cos;
                 }
             }
@@ -512,5 +670,74 @@ impl MultiResMemoryV2 {
         let cos_sim = dot(&needle_val, &retrieved_val) / (true_norm * retr_norm);
 
         cos_sim
+    }
+}
+
+#[cfg(test)]
+mod grad_check_tests {
+    use super::*;
+
+    /// Standalone finite-difference check on MultiResMemoryV2::backward_sequence in
+    /// isolation (no TesseraStage/TesseraModel wrapping), using a simple sum-of-squares loss
+    /// on h_out so the "upstream gradient" d_out is trivial (= h_out itself).
+    fn loss_and_backward(
+        mrm: &mut MultiResMemoryV2,
+        h_in: &[f32],
+        seq_len: usize,
+        d: usize,
+    ) -> (f32, Vec<f32>) {
+        let mut h_out = vec![0.0f32; seq_len * d];
+        mrm.forward_sequence(h_in, seq_len, &mut h_out);
+        let loss: f32 = h_out.iter().map(|&v| 0.5 * v * v).sum();
+
+        let d_out = h_out.clone(); // d(loss)/d(h_out) = h_out for sum(0.5*h_out^2)
+        let mut d_in = vec![0.0f32; seq_len * d];
+        let mut grads = MrmV2Grads::new(d);
+        mrm.backward_sequence(h_in, &d_out, &mut d_in, &mut grads, seq_len);
+
+        (loss, grads.grad_wq)
+    }
+
+    #[test]
+    fn mrm_v2_isolated_backward_matches_finite_difference() {
+        let d = 8;
+        let seq_len = 5;
+        // `mrm_init` is a pristine, never-forward-passed template. `forward_sequence`
+        // mutates its own memory state (fine_keys/coarse_centroids/num_occupied_slots)
+        // as a side effect via `write_token`, so each of the 3 loss evaluations below
+        // (analytical, w_q+eps, w_q-eps) MUST start from an identical clone of this
+        // pristine state. Reusing one `mrm` object across all 3 calls (as an earlier
+        // version of this test did) is invalid: the 2nd/3rd calls would start from
+        // whatever memory content the previous call's writes left behind, so the
+        // finite-difference loss values would reflect different starting memory in
+        // addition to the perturbed weight, contaminating the numerical gradient.
+        let mrm_init = MultiResMemoryV2::new(d, 6, 3, 123);
+
+        let mut rng = StdRng::seed_from_u64(555);
+        let h_in: Vec<f32> = (0..seq_len * d).map(|_| rng.gen_range(-1.0..1.0)).collect();
+
+        let mut mrm = mrm_init.clone();
+        let (_loss, grad_wq) = loss_and_backward(&mut mrm, &h_in, seq_len, d);
+        let analytical = grad_wq[0];
+
+        let eps = 1e-3f32;
+        let orig = mrm_init.w_q[0];
+
+        let mut mrm_plus = mrm_init.clone();
+        mrm_plus.w_q[0] = orig + eps;
+        let (loss_plus, _) = loss_and_backward(&mut mrm_plus, &h_in, seq_len, d);
+
+        let mut mrm_minus = mrm_init.clone();
+        mrm_minus.w_q[0] = orig - eps;
+        let (loss_minus, _) = loss_and_backward(&mut mrm_minus, &h_in, seq_len, d);
+
+        let numerical = (loss_plus - loss_minus) / (2.0 * eps);
+        let diff = (numerical - analytical).abs();
+        let rel_scale = numerical.abs().max(analytical.abs()).max(1e-3);
+        assert!(
+            diff / rel_scale < 0.15,
+            "mrm.w_q[0]: analytical={:.6} numerical={:.6} diff={:.6} (rel {:.4})",
+            analytical, numerical, diff, diff / rel_scale
+        );
     }
 }

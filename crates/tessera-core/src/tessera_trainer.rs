@@ -14,6 +14,7 @@ pub struct StageMoments {
     pub m_conv: Vec<f32>, pub v_conv: Vec<f32>,
     pub m_gate_attn: Vec<f32>, pub v_gate_attn: Vec<f32>,
     pub m_lambda: Vec<f32>, pub v_lambda: Vec<f32>,
+    pub m_vres_gate: Vec<f32>, pub v_vres_gate: Vec<f32>,
     pub m_eta: Vec<f32>, pub v_eta: Vec<f32>,
     pub m_wq: Vec<f32>, pub v_wq: Vec<f32>,
     pub m_wk: Vec<f32>, pub v_wk: Vec<f32>,
@@ -33,12 +34,13 @@ pub struct StageMoments {
 }
 
 impl StageMoments {
-    pub fn new(d: usize, d_ff: usize, r: usize, use_mrm: bool, eta_len: usize) -> Self {
+    pub fn new(d: usize, d_ff: usize, r: usize, use_mrm: bool, eta_len: usize, lambda_len: usize) -> Self {
         Self {
             m_n1: vec![0.0f32; d], v_n1: vec![0.0f32; d],
             m_conv: vec![0.0f32; 4 * d], v_conv: vec![0.0f32; 4 * d],
             m_gate_attn: vec![0.0f32; d * d], v_gate_attn: vec![0.0f32; d * d],
-            m_lambda: vec![0.0f32; 2], v_lambda: vec![0.0f32; 2],
+            m_lambda: vec![0.0f32; lambda_len], v_lambda: vec![0.0f32; lambda_len],
+            m_vres_gate: vec![0.0f32; 1], v_vres_gate: vec![0.0f32; 1],
             m_eta: vec![0.0f32; eta_len], v_eta: vec![0.0f32; eta_len],
             m_wq: vec![0.0f32; d * d], v_wq: vec![0.0f32; d * d],
             m_wk: vec![0.0f32; d * d], v_wk: vec![0.0f32; d * d],
@@ -82,7 +84,7 @@ pub struct TesseraAdamW {
 impl TesseraAdamW {
     pub fn new(model: &TesseraModel, lr: f32) -> Self {
         let stage_moments = model.stages.iter().map(|s| {
-            StageMoments::new(s.d_model, s.d_ff, s.adapter_rank, s.mrm.is_some(), s.eta_rope.len())
+            StageMoments::new(s.d_model, s.d_ff, s.adapter_rank, s.mrm.is_some(), s.eta_rope.len(), s.lambda_diff.len())
         }).collect();
 
         Self {
@@ -116,6 +118,7 @@ impl TesseraAdamW {
             for &g in &sg.grad_w_conv { sum_sq += g * g; }
             for &g in &sg.grad_w_gate_attn { sum_sq += g * g; }
             for &g in &sg.grad_lambda_diff { sum_sq += g * g; }
+            for &g in &sg.grad_vres_gate { sum_sq += g * g; }
             for &g in &sg.grad_eta_rope { sum_sq += g * g; }
             for &g in &sg.grad_wq { sum_sq += g * g; }
             for &g in &sg.grad_wk { sum_sq += g * g; }
@@ -183,6 +186,7 @@ impl TesseraAdamW {
             update_p(&mut stage.w_conv, &s_grads.grad_w_conv, &mut sm.m_conv, &mut sm.v_conv);
             update_p(&mut stage.w_gate_attn, &s_grads.grad_w_gate_attn, &mut sm.m_gate_attn, &mut sm.v_gate_attn);
             update_p(&mut stage.lambda_diff, &s_grads.grad_lambda_diff, &mut sm.m_lambda, &mut sm.v_lambda);
+            update_p(&mut stage.vres_gate, &s_grads.grad_vres_gate, &mut sm.m_vres_gate, &mut sm.v_vres_gate);
             update_p(&mut stage.eta_rope, &s_grads.grad_eta_rope, &mut sm.m_eta, &mut sm.v_eta);
             update_p(&mut stage.wq, &s_grads.grad_wq, &mut sm.m_wq, &mut sm.v_wq);
             update_p(&mut stage.wk, &s_grads.grad_wk, &mut sm.m_wk, &mut sm.v_wk);
@@ -272,10 +276,10 @@ pub fn train_tessera(
     let mut history = Vec::new();
     let max_start = train_data.len().saturating_sub(seq_len + 1);
 
-    let (p_tot, p_act, bytes_tok, l3_res) = model.parameter_metrics();
+    let (p_tot, p_act, bytes_tok, param_bytes, mem_footprint_bytes) = model.parameter_metrics();
     println!(
-        "Training {} | Total P: {:.2}M, Active P: {:.2}M | DRAM/tok: {} B | L3 Core: {:.2} MB | Steps: {}",
-        label, p_tot as f32 / 1e6, p_act as f32 / 1e6, bytes_tok, l3_res as f32 / 1e6, max_steps
+        "Training {} | Total P: {:.2}M, Active P: {:.2}M | DRAM/tok: {} B | Param Weights: {:.2} MB | MRM-v2 Memory Footprint: {:.2} MB | Steps: {}",
+        label, p_tot as f32 / 1e6, p_act as f32 / 1e6, bytes_tok, param_bytes as f32 / 1e6, mem_footprint_bytes as f32 / 1e6, max_steps
     );
 
     for step in 1..=max_steps {
@@ -336,6 +340,7 @@ pub fn train_tessera(
             axiom_core::tensor::vec_scale(&mut sg.grad_w_conv, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_w_gate_attn, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_lambda_diff, scale);
+            axiom_core::tensor::vec_scale(&mut sg.grad_vres_gate, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_eta_rope, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_wq, scale);
             axiom_core::tensor::vec_scale(&mut sg.grad_wk, scale);

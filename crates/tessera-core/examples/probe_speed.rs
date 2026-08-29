@@ -19,7 +19,7 @@ fn main() {
     };
     let seq_len = 128usize;
     let mut model = TesseraModel::new(256, seq_len, cfg, 42);
-    let (total, _active, _dram, _l3) = model.parameter_metrics();
+    let (total, _active, _dram, _param_bytes, _mem_footprint) = model.parameter_metrics();
     println!("Total params: {:.3} M", total as f32 / 1e6);
 
     let mut grads = TesseraModelGrads::new(model.vocab_size, model.d_model, model.max_seq_len, &model.stages);
