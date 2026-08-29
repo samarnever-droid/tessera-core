@@ -61,15 +61,31 @@ class AdaptiveRoPE(nn.Module):
 
 
 class DifferentialAttention(nn.Module):
-    """Microsoft Differential Attention (DiffAttn) with QK-Norm."""
+    """
+    Microsoft Differential Attention (DiffAttn) with QK-Norm.
 
-    def __init__(self, d_model: int = 128, n_heads: int = 4):
+    UNIFIED LAMBDA FORMULA (matches crates/tessera-core/src/tessera_model.rs and the
+    corrected tessera_triton.py exactly), replacing the OLD, THIRD-distinct formula this
+    module previously used (`lambda_q1/k1/q2/k2` (n_pairs, d_head) tensors with
+    `l1=exp((lambda_q1*lambda_k1).sum(-1))`, fixed non-depth-dependent `lambda_init=0.8`):
+        lambda_eff_p = max(0, exp(a_p) - exp(b_p) + lambda_init(l))
+        lambda_init(l) = 0.8 - 0.6 * exp(-0.3 * (l - 1)),  l = layer_idx + 1 (1-indexed)
+
+    LEARNED VALUE RESIDUAL (ResFormer, arXiv:2410.17897): replaces the previously
+    hardcoded `v = 0.7 * v + 0.3 * v0_residual` with a trainable PRE-sigmoid scalar
+    `vres_gate`; effective mixing weight w = sigmoid(vres_gate), V_mixed = w * V_raw +
+    (1 - w) * V_0, initialized so sigmoid(vres_gate) ~= 0.7 (matches the old hardcoded
+    constant as the learned starting point).
+    """
+
+    def __init__(self, d_model: int = 128, n_heads: int = 4, layer_idx: int = 0):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
         assert n_heads % 2 == 0, "n_heads must be even for Differential Attention head pairs"
         self.n_pairs = n_heads // 2
+        self.layer_idx = layer_idx
 
         self.wq = nn.Linear(d_model, d_model, bias=False)
         self.wk = nn.Linear(d_model, d_model, bias=False)
@@ -80,18 +96,32 @@ class DifferentialAttention(nn.Module):
         self.q_norm = RMSNorm(self.d_head)
         self.k_norm = RMSNorm(self.d_head)
 
-        # Learnable lambda parameters: lambda = exp(l_q1 * l_k1) - exp(l_q2 * l_k2) + lambda_init
-        self.lambda_q1 = nn.Parameter(torch.zeros(self.n_pairs, self.d_head))
-        self.lambda_k1 = nn.Parameter(torch.zeros(self.n_pairs, self.d_head))
-        self.lambda_q2 = nn.Parameter(torch.zeros(self.n_pairs, self.d_head))
-        self.lambda_k2 = nn.Parameter(torch.zeros(self.n_pairs, self.d_head))
-        self.lambda_init = 0.8
+        # Depth-dependent DiffAttn lambda init (arXiv:2410.05258): l is 1-indexed, NON-
+        # trainable (a plain Python float baked into forward), matching Rust's
+        # TesseraStage.lambda_init field and tessera_triton.py's DifferentialAttention exactly.
+        l = float(layer_idx + 1)
+        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * (l - 1.0))
+
+        # Raw per-pair a_p/b_p logits, zero-initialized so lambda_eff_p == lambda_init
+        # exactly at construction (exp(0) - exp(0) + lambda_init).
+        self.lambda_diff = nn.Parameter(torch.zeros(2 * self.n_pairs, dtype=torch.float32))
+
+        # Learned Value-Residual gate: PRE-sigmoid raw scalar, sigmoid(vres_gate) ~= 0.7
+        # (sigmoid^-1(0.7) = ln(0.7/0.3) ~= 0.8473).
+        self.vres_gate = nn.Parameter(torch.tensor(0.8473, dtype=torch.float32))
+
+    def lambda_eff(self, p: int) -> torch.Tensor:
+        """Effective per-pair lambda using the unified formula (see class docstring)."""
+        a_p = self.lambda_diff[2 * p]
+        b_p = self.lambda_diff[2 * p + 1]
+        return torch.clamp(torch.exp(a_p) - torch.exp(b_p) + self.lambda_init, min=0.0)
 
     def forward(self, x: torch.Tensor, v0_residual: torch.Tensor = None) -> tuple[torch.Tensor, torch.Tensor]:
         b, t, d = x.shape
         q = self.wq(x).view(b, t, self.n_heads, self.d_head).transpose(1, 2)
         k = self.wk(x).view(b, t, self.n_heads, self.d_head).transpose(1, 2)
         v = self.wv(x).view(b, t, self.n_heads, self.d_head).transpose(1, 2)
+        v_raw = v  # this stage's own pre-value-residual-mix value projection (v0 cache)
 
         # Apply Adaptive RoPE
         q = self.rope(q, t)
@@ -101,10 +131,12 @@ class DifferentialAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # Value Residual Connection: V_s = 0.7 * V_s + 0.3 * V_0
+        # Learned Value Residual Connection: V_mixed = w * V_raw + (1 - w) * V_0,
+        # w = sigmoid(vres_gate). Replaces the old hardcoded 0.7/0.3 constants.
         if v0_residual is not None:
-            v = 0.7 * v + 0.3 * v0_residual
-        current_v = v
+            w = torch.sigmoid(self.vres_gate)
+            v = w * v_raw + (1.0 - w) * v0_residual
+        current_v = v_raw
 
         # Split into Differential head pairs (Q1, K1) and (Q2, K2)
         scale = 1.0 / math.sqrt(self.d_head)
@@ -124,10 +156,8 @@ class DifferentialAttention(nn.Module):
         attn1 = F.softmax(scores1, dim=-1)
         attn2 = F.softmax(scores2, dim=-1)
 
-        # Compute dynamic lambda per head pair
-        l1 = torch.exp((self.lambda_q1 * self.lambda_k1).sum(dim=-1)).view(1, self.n_pairs, 1, 1)
-        l2 = torch.exp((self.lambda_q2 * self.lambda_k2).sum(dim=-1)).view(1, self.n_pairs, 1, 1)
-        lam = l1 - l2 + self.lambda_init
+        # Compute unified per-pair lambda (see class docstring / lambda_eff above).
+        lam = torch.stack([self.lambda_eff(p) for p in range(self.n_pairs)]).view(1, self.n_pairs, 1, 1)
 
         diff_attn = attn1 - lam * attn2
         ctx = torch.matmul(diff_attn, v_pairs) # (b, n_pairs, t, d_head)
@@ -184,13 +214,15 @@ class MultiResMemoryV2(nn.Module):
 class TesseraStagePyTorch(nn.Module):
     """Frontier Progressive Folding Stage."""
 
-    def __init__(self, d_model: int = 128, d_ffn: int = 512, n_heads: int = 4, r_adapter: int = 8, use_mrm: bool = True):
+    def __init__(self, d_model: int = 128, d_ffn: int = 512, n_heads: int = 4, r_adapter: int = 8,
+                 use_mrm: bool = True, layer_idx: int = 0):
         super().__init__()
         self.d_model = d_model
+        self.layer_idx = layer_idx
         self.norm1 = RMSNorm(d_model)
         self.conv1d = nn.Conv1d(d_model, d_model, kernel_size=4, padding=3, groups=d_model, bias=False)
         self.gate_attn = nn.Linear(d_model, d_model, bias=False)
-        self.diff_attn = DifferentialAttention(d_model, n_heads)
+        self.diff_attn = DifferentialAttention(d_model, n_heads, layer_idx=layer_idx)
 
         self.norm2 = RMSNorm(d_model)
         self.w1 = nn.Linear(d_model, d_ffn, bias=False)
@@ -253,8 +285,8 @@ class TesseraModelPyTorch(nn.Module):
         self.embeddings = nn.Embedding(vocab_size, d_model)
 
         self.stages = nn.ModuleList([
-            TesseraStagePyTorch(d_model, d_ffn, n_heads, r_adapter, use_mrm)
-            for _ in range(n_stages)
+            TesseraStagePyTorch(d_model, d_ffn, n_heads, r_adapter, use_mrm, layer_idx=p)
+            for p in range(n_stages)
         ])
 
         self.final_norm = RMSNorm(d_model)

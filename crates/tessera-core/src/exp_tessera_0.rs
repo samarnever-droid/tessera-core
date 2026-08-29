@@ -15,7 +15,12 @@ pub struct TesseraArmResult {
     pub total_params: usize,
     pub active_params: usize,
     pub dram_bytes_per_token: usize,
-    pub resident_l3_bytes: usize,
+    /// Byte size of LEARNED weights only (item 6: separated from memory_footprint_bytes,
+    /// which used to be conflated into a single "resident_l3_bytes" figure).
+    pub param_bytes: usize,
+    /// Byte size of non-parameter, per-sequence working MEMORY state (e.g. MRM-v2's
+    /// k_fine/k_coarse slot buffers). Zero for arms without a working-memory module.
+    pub memory_footprint_bytes: usize,
     pub val_loss: f32,
     pub val_bpc: f32,
     pub tokens_per_sec: f64,
@@ -79,7 +84,8 @@ pub fn run_exp_tessera_0(dataset_path: &str, steps_per_arm: usize) {
         total_params: dense_params,
         active_params: dense_params,
         dram_bytes_per_token: dense_params * 4,
-        resident_l3_bytes: 0,
+        param_bytes: dense_params * 4,
+        memory_footprint_bytes: 0,
         val_loss: t_loss,
         val_bpc: t_bpc,
         tokens_per_sec: t_tok_s,
@@ -92,7 +98,7 @@ pub fn run_exp_tessera_0(dataset_path: &str, steps_per_arm: usize) {
     let mut cfg_b = TesseraConfig::nano_default();
     cfg_b.use_mrm_v2 = false;
     let mut model_b = TesseraModel::new(vocab_size, seq_len, cfg_b, 42);
-    let (b_tot, b_act, b_dram, b_l3) = model_b.parameter_metrics();
+    let (b_tot, b_act, b_dram, b_param_bytes, b_mem_footprint) = model_b.parameter_metrics();
 
     let b_history = train_tessera(
         &mut model_b,
@@ -115,7 +121,8 @@ pub fn run_exp_tessera_0(dataset_path: &str, steps_per_arm: usize) {
         total_params: b_tot,
         active_params: b_act,
         dram_bytes_per_token: b_dram,
-        resident_l3_bytes: b_l3,
+        param_bytes: b_param_bytes,
+        memory_footprint_bytes: b_mem_footprint,
         val_loss: b_loss,
         val_bpc: b_bpc,
         tokens_per_sec: b_tok_s,
@@ -128,7 +135,7 @@ pub fn run_exp_tessera_0(dataset_path: &str, steps_per_arm: usize) {
     let mut cfg_c = TesseraConfig::nano_default();
     cfg_c.use_mrm_v2 = true;
     let mut model_c = TesseraModel::new(vocab_size, seq_len, cfg_c, 42);
-    let (c_tot, c_act, c_dram, c_l3) = model_c.parameter_metrics();
+    let (c_tot, c_act, c_dram, c_param_bytes, c_mem_footprint) = model_c.parameter_metrics();
 
     let c_history = train_tessera(
         &mut model_c,
@@ -151,7 +158,8 @@ pub fn run_exp_tessera_0(dataset_path: &str, steps_per_arm: usize) {
         total_params: c_tot,
         active_params: c_act,
         dram_bytes_per_token: c_dram,
-        resident_l3_bytes: c_l3,
+        param_bytes: c_param_bytes,
+        memory_footprint_bytes: c_mem_footprint,
         val_loss: c_loss,
         val_bpc: c_bpc,
         tokens_per_sec: c_tok_s,
@@ -180,24 +188,31 @@ pub fn run_exp_tessera_0(dataset_path: &str, steps_per_arm: usize) {
         successful_recalls, num_needle_trials, needle_recall_rate, avg_cos_sim);
 
     // ── Comparative Performance Table ─────────────────────────────────────
-    println!("\n=======================================================================================================================");
+    // NOTE (item 6): "Param MB" and "Mem Footprint MB" are reported as two SEPARATE columns.
+    // Param MB = bytes of LEARNED weights only. Mem Footprint MB = bytes of non-parameter,
+    // per-sequence working memory state (e.g. MRM-v2 k_fine/k_coarse slots). These used to be
+    // conflated into a single "resident_l3_bytes = total_params * 4" figure, which always
+    // equaled Param MB and silently ignored the working-memory cost entirely.
+    println!("\n=======================================================================================================================================");
     println!("                                   EXP-TESSERA-0 MEASURED BENCHMARK MATRIX");
-    println!("=======================================================================================================================");
-    println!("{:<36} | {:<10} | {:<10} | {:<12} | {:<9} | {:<9} | {:<9}",
-        "Configuration", "Total P", "Active P", "DRAM B/tok", "Val Loss", "Val BPC", "Tok/s");
-    println!("-----------------------------------------------------------------------------------------------------------------------");
+    println!("=======================================================================================================================================");
+    println!("{:<36} | {:<10} | {:<10} | {:<12} | {:<10} | {:<14} | {:<9} | {:<9} | {:<9}",
+        "Configuration", "Total P", "Active P", "DRAM B/tok", "Param MB", "Mem Footpr. MB", "Val Loss", "Val BPC", "Tok/s");
+    println!("-----------------------------------------------------------------------------------------------------------------------------------");
     for r in &results {
-        println!("{:<36} | {:<10} | {:<10} | {:<12} | {:<9.4} | {:<9.4} | {:<9.0}",
+        println!("{:<36} | {:<10} | {:<10} | {:<12} | {:<10} | {:<14} | {:<9.4} | {:<9.4} | {:<9.0}",
             r.arm_name,
             format!("{:.2}M", r.total_params as f32 / 1e6),
             format!("{:.2}M", r.active_params as f32 / 1e6),
             format!("{} B", r.dram_bytes_per_token),
+            format!("{:.2}", r.param_bytes as f32 / 1e6),
+            format!("{:.2}", r.memory_footprint_bytes as f32 / 1e6),
             r.val_loss,
             r.val_bpc,
             r.tokens_per_sec,
         );
     }
-    println!("=======================================================================================================================\n");
+    println!("=======================================================================================================================================\n");
 
     // ── Pre-Registered Kill Criteria Evaluation ───────────────────────────
     println!("==========================================================================");

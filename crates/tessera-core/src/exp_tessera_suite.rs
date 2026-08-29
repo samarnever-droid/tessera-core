@@ -198,7 +198,7 @@ pub fn run_protocol_5_memory_scaling(dataset_path: &str, steps: usize) {
         let mut cfg = TesseraConfig::nano_default();
         cfg.k_fine_slots = k;
         let mut model = TesseraModel::new(vocab_size, seq_len, cfg, 42);
-        let (_, _, dram_b, _) = model.parameter_metrics();
+        let (_, _, dram_b, _, _) = model.parameter_metrics();
 
         let _ = train_tessera(&mut model, &train_data.data, &val_data.data, batch_size, seq_len, max_time_secs, steps, base_lr, "MemScaling");
         let (loss, bpc) = evaluate_tessera_bpc(&mut model, &val_data.data, 20, seq_len);

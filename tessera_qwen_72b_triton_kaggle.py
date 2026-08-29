@@ -530,7 +530,22 @@ class StreamingTesseraQwenLayer:
         self.down_proj = load_gptq_linear_helper(prefix + ".mlp.down_proj", device, qwen_loader)
 
         self.eta_rope = torch.zeros(64, device=device, dtype=torch.float32)
-        self.lambda_diff = 0.80
+
+        # UNIFIED DiffAttn lambda formula (matches crates/tessera-core/src/tessera_model.rs,
+        # tessera_triton.py, tessera_pytorch.py exactly), replacing the previously hardcoded
+        # scalar `self.lambda_diff = 0.80` (identical at every depth, no exp/clamp):
+        #   lambda_eff_p = max(0, exp(a_p) - exp(b_p) + lambda_init(layer_idx))
+        #   lambda_init(l) = 0.8 - 0.6 * exp(-0.3 * (l - 1)),  l = layer_idx + 1 (1-indexed)
+        # `self.layer_idx` is already available from the constructor param above (used for
+        # weight-loading), so depth-dependence falls out naturally. n_pairs=32 here (q has
+        # 64 sub-heads per .view(1, 1, 64, 128) in step() below, split into 32 head-pairs by
+        # the 0::2 / 1::2 slicing in differential_attention()).
+        n_pairs = 32
+        l = float(self.layer_idx + 1)
+        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * (l - 1.0))
+        # Raw per-pair a_p/b_p logits, zero-initialized so lambda_eff_p == lambda_init
+        # exactly at construction, matching this codebase's zero-init convention elsewhere.
+        self.lambda_ab = torch.zeros((n_pairs, 2), device=device, dtype=torch.float32)
 
     @torch.no_grad()
     def differential_attention(self, q: torch.Tensor) -> torch.Tensor:
@@ -562,7 +577,13 @@ class StreamingTesseraQwenLayer:
         p1 = torch.softmax(s1, dim=-1)
         p2 = torch.softmax(s2, dim=-1)
 
-        pdiff = p1 - self.lambda_diff * p2
+        # Unified per-pair lambda_eff (see self.lambda_ab / self.lambda_init in __init__):
+        # lambda_eff_p = max(0, exp(a_p) - exp(b_p) + lambda_init). h indexes the 32
+        # head-pairs (p1/p2/pdiff have shape [n_pairs=32, seq_len]).
+        a = self.lambda_ab[:, 0]
+        b = self.lambda_ab[:, 1]
+        lambda_eff = torch.clamp(torch.exp(a) - torch.exp(b) + self.lambda_init, min=0.0)
+        pdiff = p1 - lambda_eff.unsqueeze(-1) * p2
         out1 = torch.einsum("hs,shd->hd", pdiff, v1)
         out2 = torch.einsum("hs,shd->hd", pdiff, v2)
 

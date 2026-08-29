@@ -29,12 +29,13 @@ fn main() {
     let mut model = TesseraModel::new(vocab_size, max_seq_len, config, 42);
     let init_dur = t0.elapsed().as_secs_f32() * 1000.0;
 
-    let (total_p, active_p, dram_b, l3_b) = model.parameter_metrics();
+    let (total_p, active_p, dram_b, param_bytes, mem_footprint_bytes) = model.parameter_metrics();
     println!("✓ TesseraModel initialized in {:.2} ms", init_dur);
     println!("  ├── Total Parameters:  {:>10}", total_p);
     println!("  ├── Active Parameters: {:>10}", active_p);
     println!("  ├── DRAM per Token:    {:>10} bytes", dram_b);
-    println!("  ├── L3 Footprint:      {:>10} bytes ({:.2} MB)", l3_b, l3_b as f32 / (1024.0 * 1024.0));
+    println!("  ├── Param Weights:     {:>10} bytes ({:.2} MB)", param_bytes, param_bytes as f32 / (1024.0 * 1024.0));
+    println!("  ├── MRM-v2 Mem Footpr: {:>10} bytes ({:.2} MB)", mem_footprint_bytes, mem_footprint_bytes as f32 / (1024.0 * 1024.0));
     println!("  └── Inbuilt Meridian:  {:?}", model.meridian_memory.is_some());
     assert!(model.meridian_memory.is_some(), "Meridian memory must be natively active inside model");
 

@@ -14,6 +14,7 @@ Features:
 
 import math
 import os
+import struct
 import sys
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -328,26 +329,62 @@ class MultiResMemory(nn.Module):
 class DifferentialAttention(nn.Module):
     """
     Microsoft Differential Attention (DiffAttn) Module with Adaptive RoPE & QK-Norm.
-    A_diff = Softmax(Q1 K1^T / √d_k) - λ · Softmax(Q2 K2^T / √d_k)
+    A_diff = Softmax(Q1 K1^T / √d_k) - λ_eff · Softmax(Q2 K2^T / √d_k)
+
+    UNIFIED LAMBDA FORMULA (matches crates/tessera-core/src/tessera_model.rs exactly, per
+    head-pair p, with raw trainable logits a_p/b_p and a depth-dependent, non-trainable
+    lambda_init derived from this module's 0-indexed layer_idx):
+        lambda_eff_p = max(0, exp(a_p) - exp(b_p) + lambda_init(l))
+        lambda_init(l) = 0.8 - 0.6 * exp(-0.3 * (l - 1)),  l = layer_idx + 1 (1-indexed)
+    This replaces the OLD code's `self.lambda_diff = nn.Parameter([0.8, 0.8])` used directly
+    as `lam = self.lambda_diff[p]` -- a formula that had no depth-dependence, no exp/clamp,
+    and did not match the Rust engine's train/inference-unified formula at all. See
+    docs/TESSERA_DEEP_RESEARCH_PROMPT.md for the original train/inference divergence bug this
+    unification fixes.
+
+    LEARNED VALUE RESIDUAL (ResFormer, arXiv:2410.17897): `vres_gate` is a trainable
+    PRE-sigmoid scalar; effective mixing weight w = sigmoid(vres_gate) is used as
+    V_mixed = w * V_raw + (1 - w) * V_0 for every stage after the first, replacing the
+    previously-hardcoded/absent value-residual mixing. Initialized so sigmoid(vres_gate)
+    ~= 0.7, matching the old hardcoded 0.7/0.3 constants as the learned starting point.
     """
 
-    def __init__(self, d_model: int = 128, n_heads: int = 4):
+    def __init__(self, d_model: int = 128, n_heads: int = 4, layer_idx: int = 0):
         super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads         # 4 subheads = 2 differential pairs
         self.n_pairs = n_heads // 2    # 2 differential head pairs
         self.d_k = d_model // n_heads  # 32
         self.d_v = d_model // self.n_pairs # 64
+        self.layer_idx = layer_idx
 
         self.wq = nn.Linear(d_model, d_model, bias=False)
         self.wk = nn.Linear(d_model, d_model, bias=False)
         self.wv = nn.Linear(d_model, d_model, bias=False)
         self.wo = nn.Linear(d_model, d_model, bias=False)
 
-        # Learnable Noise-Cancelling Lambdas (Initialized to 0.8)
-        self.lambda_diff = nn.Parameter(torch.tensor([0.8, 0.8], dtype=torch.float32))
+        # Depth-dependent DiffAttn lambda init (arXiv:2410.05258): l is 1-indexed.
+        # NON-trainable (a plain Python float baked into the forward pass), matching Rust's
+        # TesseraStage.lambda_init field exactly.
+        l = float(layer_idx + 1)
+        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * (l - 1.0))
+
+        # Raw per-pair a_p/b_p logits, zero-initialized so that at construction
+        # lambda_eff_p = exp(0) - exp(0) + lambda_init == lambda_init exactly, for every pair.
+        self.lambda_diff = nn.Parameter(torch.zeros(2 * self.n_pairs, dtype=torch.float32))
+
+        # Learned Value-Residual gate (ResFormer): PRE-sigmoid raw scalar, initialized so
+        # sigmoid(vres_gate) ~= 0.7 (sigmoid^-1(0.7) = ln(0.7/0.3) ~= 0.8473).
+        self.vres_gate = nn.Parameter(torch.tensor(0.8473, dtype=torch.float32))
+
         # Adaptive RoPE Multipliers
         self.eta_rope = nn.Parameter(torch.zeros(self.d_k // 2, dtype=torch.float32))
+
+    def lambda_eff(self, p: int) -> torch.Tensor:
+        """Effective per-pair lambda using the unified formula (see class docstring)."""
+        a_p = self.lambda_diff[2 * p]
+        b_p = self.lambda_diff[2 * p + 1]
+        return torch.clamp(torch.exp(a_p) - torch.exp(b_p) + self.lambda_init, min=0.0)
 
     def apply_adaptive_rope(self, x: torch.Tensor) -> torch.Tensor:
         B, T, H, Dk = x.shape
@@ -372,11 +409,28 @@ class DifferentialAttention(nn.Module):
         out[..., 1::2] = out_odd
         return out
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, v0: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        x: [B, T, D]. v0: this stage's value tensor is mixed with `v0` (stage 0's raw value
+        tensor, shape [B, T, D]) via the learned gate, EXCEPT when v0 is None (i.e. this IS
+        stage 0), in which case the raw value tensor is returned unmixed and becomes the v0
+        for subsequent stages. Returns (attn_out, v_raw_for_v0_cache) where v_raw_for_v0_cache
+        is always this stage's OWN pre-mix value projection (matching Rust's `stage_v_raw`
+        cache, needed so downstream stages always mix against stage 0's true raw V, not an
+        already-mixed V).
+        """
         B, T, D = x.shape
         q = self.wq(x).view(B, T, self.n_heads, self.d_k)
         k = self.wk(x).view(B, T, self.n_heads, self.d_k)
-        v = self.wv(x).view(B, T, self.n_pairs, self.d_v)
+        v = self.wv(x).view(B, T, self.n_heads, self.d_k)  # keep per-subhead shape for v0 mixing
+        v_raw = v.reshape(B, T, D)
+
+        if v0 is not None:
+            w = torch.sigmoid(self.vres_gate)
+            v_mixed = w * v_raw + (1.0 - w) * v0
+            v = v_mixed.view(B, T, self.n_heads, self.d_k)
+
+        v_pairs = v.view(B, T, self.n_pairs, self.d_v)
 
         # Adaptive RoPE
         q = self.apply_adaptive_rope(q)
@@ -393,11 +447,11 @@ class DifferentialAttention(nn.Module):
         for p in range(self.n_pairs):
             h1 = 2 * p
             h2 = 2 * p + 1
-            lam = self.lambda_diff[p]
+            lam = self.lambda_eff(p)
 
             q1, q2 = q[:, :, h1, :], q[:, :, h2, :]
             k1, k2 = k[:, :, h1, :], k[:, :, h2, :]
-            vp = v[:, :, p, :]
+            vp = v_pairs[:, :, p, :]
 
             scores1 = (torch.bmm(q1, k1.transpose(1, 2)) * scale) + causal_mask
             scores2 = (torch.bmm(q2, k2.transpose(1, 2)) * scale) + causal_mask
@@ -410,7 +464,7 @@ class DifferentialAttention(nn.Module):
             out_pairs.append(ctx_p)
 
         attn_out = torch.cat(out_pairs, dim=-1)
-        return self.wo(attn_out)
+        return self.wo(attn_out), v_raw
 
 
 # =================================================================================================
@@ -420,16 +474,17 @@ class DifferentialAttention(nn.Module):
 class TesseraStageGPU(nn.Module):
     """Full Progressive Hierarchy Stage with 1D Depthwise Conv + DiffAttn + SwiGLU + MRM."""
 
-    def __init__(self, d_model: int = 128, d_ff: int = 768, n_heads: int = 4, use_mrm: bool = False):
+    def __init__(self, d_model: int = 128, d_ff: int = 768, n_heads: int = 4, use_mrm: bool = False, layer_idx: int = 0):
         super().__init__()
         self.d_model = d_model
         self.use_mrm = use_mrm
+        self.layer_idx = layer_idx
 
         self.norm1 = nn.RMSNorm(d_model)
         # 1D Depthwise Causal Convolution (k=4)
         self.conv1d = nn.Conv1d(d_model, d_model, kernel_size=4, padding=3, groups=d_model, bias=False)
         self.w_gate_attn = nn.Linear(d_model, d_model, bias=False)
-        self.diff_attn = DifferentialAttention(d_model, n_heads)
+        self.diff_attn = DifferentialAttention(d_model, n_heads, layer_idx=layer_idx)
 
         self.norm2 = nn.RMSNorm(d_model)
         self.w1 = nn.Linear(d_model, d_ff, bias=False)
@@ -444,6 +499,8 @@ class TesseraStageGPU(nn.Module):
         self.mrm = MultiResMemory(d_model) if use_mrm else None
 
     def forward(self, x: torch.Tensor, v0: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (h_stage_out, v_raw) where v_raw is THIS stage's own pre-value-residual-mix
+        value projection (used as the v0 cache for downstream stages when this is stage 0)."""
         B, T, D = x.shape
         h_norm1 = self.norm1(x)
 
@@ -451,8 +508,9 @@ class TesseraStageGPU(nn.Module):
         conv_out = self.conv1d(h_norm1.transpose(1, 2))[:, :, :T].transpose(1, 2)
         gate_attn = F.silu(self.w_gate_attn(h_norm1))
 
-        # Differential Attention
-        attn_out = self.diff_attn(conv_out) * gate_attn
+        # Differential Attention (with learned Value-Residual mixing against v0)
+        attn_raw, v_raw = self.diff_attn(conv_out, v0)
+        attn_out = attn_raw * gate_attn
         h_mid = x + attn_out
 
         # SwiGLU + Adapter
@@ -466,7 +524,7 @@ class TesseraStageGPU(nn.Module):
         if self.mrm is not None:
             h_stage = self.mrm(h_stage)
 
-        return h_stage, conv_out
+        return h_stage, v_raw
 
 
 # =================================================================================================
@@ -479,7 +537,8 @@ class TesseraGPUModel(nn.Module):
     Tied Embeddings, Multi-Token Prediction (MTP), PaLM Z-Loss, and L2-Resident MRM.
     """
 
-    def __init__(self, vocab_size: int = 256, d_model: int = 128, d_ff: int = 768, n_stages: int = 3):
+    def __init__(self, vocab_size: int = 256, d_model: int = 128, d_ff: int = 768, n_stages: int = 3,
+                 n_heads: int = 4):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -488,7 +547,7 @@ class TesseraGPUModel(nn.Module):
         self.embeddings = nn.Embedding(vocab_size, d_model)
 
         self.stages = nn.ModuleList([
-            TesseraStageGPU(d_model, d_ff, n_heads=4, use_mrm=(p == n_stages - 1))
+            TesseraStageGPU(d_model, d_ff, n_heads=n_heads, use_mrm=(p == n_stages - 1), layer_idx=p)
             for p in range(n_stages)
         ])
 
@@ -508,9 +567,16 @@ class TesseraGPUModel(nn.Module):
         B, T = input_ids.shape
         h = self.embeddings(input_ids)
 
+        # Value Residual (ResFormer): v0 is fixed to STAGE 0's raw value projection and stays
+        # constant for every subsequent stage's mixing (matches Rust's `v0_cache`, which is set
+        # once at s_idx==0 and never overwritten). Do NOT reassign v0 to each stage's own
+        # v_raw -- that would make every stage mix against its immediate predecessor instead
+        # of against stage 0, which is architecturally wrong per ResFormer (arXiv:2410.17897).
         v0 = None
-        for stage in self.stages:
-            h, v0 = stage(h, v0)
+        for s_idx, stage in enumerate(self.stages):
+            h, v_raw = stage(h, v0)
+            if s_idx == 0:
+                v0 = v_raw
 
         h_final = self.final_norm(h)
 
@@ -546,38 +612,333 @@ class TesseraGPUModel(nn.Module):
 
         return output
 
+    @torch.no_grad()
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 64,
+        temperature: float = 0.8,
+        top_k: int = 40,
+        seed: Optional[int] = None,
+        device: Optional[torch.device] = None,
+    ) -> str:
+        """
+        SINGLE-USER autoregressive text generation, byte-level, mirroring Rust's
+        `TesseraModel::generate_text` (crates/tessera-core/src/tessera_model.rs) exactly:
+        full-context recompute every step (no incremental KV cache -- matches the Rust
+        engine's own recompute-based `forward_last_logits`), temperature-scaled top-k
+        sampling with a numerically stable exp(l - max) sum, and a bounded context window.
+
+        prompt: input text (encoded as raw UTF-8 bytes, vocab_size=256 byte-level model).
+        Returns the decoded string (prompt + generated continuation).
+        """
+        self.eval()
+        dev = device if device is not None else next(self.parameters()).device
+        gen = torch.Generator(device="cpu")
+        if seed is not None:
+            gen.manual_seed(int(seed))
+
+        max_seq_len = getattr(self, "max_seq_len", 512)
+        tokens = list(prompt.encode("utf-8")) or [ord(" ")]
+        temp = max(temperature, 1e-4)
+
+        for _ in range(max_new_tokens):
+            ctx = tokens[-max_seq_len:] if len(tokens) > max_seq_len else tokens
+            ids = torch.tensor([ctx], dtype=torch.long, device=dev)
+            logits = self(ids)["logits"][0, -1, :]  # [vocab_size]
+
+            scaled = logits / temp
+            k = min(top_k, scaled.numel())
+            top_vals, top_idx = torch.topk(scaled, k)
+            probs = F.softmax(top_vals, dim=-1).to("cpu")
+
+            choice = torch.multinomial(probs, num_samples=1, generator=gen).item()
+            next_tok = int(top_idx[choice].item())
+            tokens.append(next_tok)
+
+        out_bytes = bytes(t % 256 for t in tokens)
+        return out_bytes.decode("utf-8", errors="replace")
+
+    @torch.no_grad()
+    def generate_batch(
+        self,
+        prompts: "list[str]",
+        max_new_tokens: int = 64,
+        temperature: float = 0.8,
+        top_k: int = 40,
+        seed: Optional[int] = None,
+        device: Optional[torch.device] = None,
+    ) -> "list[str]":
+        """
+        MULTI-USER / concurrent inference: generates continuations for a batch of B
+        independent prompts/sessions in parallel on the same GPU/CPU forward pass, each
+        with its own token history and independent sampling draw. This is the natural
+        batched extension of `generate()` above -- the model's forward pass already
+        operates over a leading batch dimension [B, T, D] end-to-end (embeddings, DiffAttn,
+        MRM), so B independent "users" share compute for every step while still sampling
+        their own next token from their own row of logits. RIGHT-padding (with byte 0) is
+        used so ragged per-user histories can share a single batched forward call: because
+        both the depthwise causal conv (kernel=4, causal via symmetric-pad-then-trim) and
+        DiffAttn's upper-triangular causal mask only ever look BACKWARD in the time
+        dimension, trailing padding placed strictly AFTER each row's true last token can
+        never influence that true last token's own logits -- so each user's real next-token
+        distribution is bit-for-bit identical to running that user alone at their own true
+        length, letting all B users share one forward pass safely without needing an
+        explicit attention-mask plumbed through conv/DiffAttn (which this simplified engine
+        does not implement).
+        """
+        self.eval()
+        dev = device if device is not None else next(self.parameters()).device
+        gen = torch.Generator(device="cpu")
+        if seed is not None:
+            gen.manual_seed(int(seed))
+
+        max_seq_len = getattr(self, "max_seq_len", 512)
+        B = len(prompts)
+        token_lists = [list(p.encode("utf-8")) or [ord(" ")] for p in prompts]
+        temp = max(temperature, 1e-4)
+
+        for _ in range(max_new_tokens):
+            ctxs = [tl[-max_seq_len:] if len(tl) > max_seq_len else tl for tl in token_lists]
+            max_len = max(len(c) for c in ctxs)
+            # Right-pad each row to max_len with 0 so the batch can share one forward call;
+            # each row's TRUE last-token position (before padding) is recorded in last_pos
+            # and is what we read logits from -- padding after it is causally invisible.
+            padded = torch.zeros(B, max_len, dtype=torch.long, device=dev)
+            last_pos = torch.empty(B, dtype=torch.long, device=dev)
+            for i, c in enumerate(ctxs):
+                padded[i, :len(c)] = torch.tensor(c, dtype=torch.long, device=dev)
+                last_pos[i] = len(c) - 1  # true last token position within this row
+
+            logits_all = self(padded)["logits"]  # [B, max_len, vocab_size]
+            row_idx = torch.arange(B, device=dev)
+            logits = logits_all[row_idx, last_pos, :]  # [B, vocab_size]
+
+            scaled = logits / temp
+            k = min(top_k, scaled.size(-1))
+            top_vals, top_idx = torch.topk(scaled, k, dim=-1)
+            probs = F.softmax(top_vals, dim=-1).to("cpu")
+
+            for i in range(B):
+                choice = torch.multinomial(probs[i], num_samples=1, generator=gen).item()
+                next_tok = int(top_idx[i, choice].item())
+                token_lists[i].append(next_tok)
+
+        results = []
+        for tl in token_lists:
+            out_bytes = bytes(t % 256 for t in tl)
+            results.append(out_bytes.decode("utf-8", errors="replace"))
+        return results
+
     def export_to_binary(self, path: str):
-        """Export model weights to flat little-endian binary file loadable by Rust engine."""
+        """
+        Export model weights to the flat little-endian binary format actually read by
+        `TesseraModel::load_binary` in crates/tessera-core/src/tessera_model.rs.
+
+        FIX: the previous version of this method wrote an 8-byte b"TESSERA\\0" magic tag as
+        the first bytes of the file and a fixed-size, un-length-prefixed 2-float
+        `lambda_diff` per stage with no `lambda_init`/`vres_gate` fields at all. NONE of that
+        matches the real Rust reader, which expects (in exact order):
+          1. A 24-byte header of SIX raw little-endian u32s (NOT an 8-byte magic string):
+             vocab_size, d_model, d_ff, n_stages, n_heads, adapter_rank.
+          2. embeddings: vocab_size * d_model f32.
+          3. Per stage: norm1_gamma (d), w_conv (4*d), w_gate_attn (d*d),
+             [u32 lambda_len] lambda_diff (lambda_len), lambda_init (1 f32),
+             vres_gate (1 f32), eta_rope (d_k/2), wq/wk/wv/wo (d*d each),
+             norm2_gamma (d), w1/w1u (d_ff*d each), w2 (d*d_ff).
+          4. final_norm_gamma (d).
+        A file written by the OLD version of this method would silently desync every single
+        field read by Rust's loader (wrong header size, wrong stage layout, missing
+        lambda_init/vres_gate) -- this was a real, previously undiscovered cross-language
+        format bug, not just a lambda-formula mismatch.
+        """
+        d = self.d_model
+        n_heads = self.stages[0].diff_attn.n_heads if len(self.stages) > 0 else 4
+
+        def f32(t: torch.Tensor) -> bytes:
+            return t.detach().cpu().contiguous().to(torch.float32).numpy().tobytes()
+
         with open(path, "wb") as f:
-            f.write(b"TESSERA\0")
+            # Header: 6 raw u32s, NO magic string (matches Rust's 24-byte header exactly).
             f.write(int(self.vocab_size).to_bytes(4, "little"))
             f.write(int(self.d_model).to_bytes(4, "little"))
             f.write(int(self.d_ff).to_bytes(4, "little"))
             f.write(int(len(self.stages)).to_bytes(4, "little"))
+            f.write(int(n_heads).to_bytes(4, "little"))
+            f.write(int(8).to_bytes(4, "little"))  # adapter_rank, fixed at 8 in this engine
 
-            # Dump embeddings
-            f.write(self.embeddings.weight.detach().cpu().to(torch.float32).numpy().tobytes())
+            # Dump embeddings (vocab_size x d_model, row-major -- matches Rust's MatrixView
+            # convention and nn.Embedding.weight's native layout).
+            f.write(f32(self.embeddings.weight))
 
-            # Dump stages
             for stage in self.stages:
-                f.write(stage.norm1.weight.detach().cpu().to(torch.float32).numpy().tobytes())
-                f.write(stage.conv1d.weight.detach().cpu().to(torch.float32).numpy().tobytes())
-                f.write(stage.w_gate_attn.weight.detach().cpu().to(torch.float32).numpy().tobytes())
-                f.write(stage.diff_attn.lambda_diff.detach().cpu().to(torch.float32).numpy().tobytes())
-                f.write(stage.diff_attn.eta_rope.detach().cpu().to(torch.float32).numpy().tobytes())
-                f.write(stage.diff_attn.wq.weight.detach().cpu().to(torch.float32).numpy().tobytes())
-                f.write(stage.diff_attn.wk.weight.detach().cpu().to(torch.float32).numpy().tobytes())
-                f.write(stage.diff_attn.wv.weight.detach().cpu().to(torch.float32).numpy().tobytes())
-                f.write(stage.diff_attn.wo.weight.detach().cpu().to(torch.float32).numpy().tobytes())
-                f.write(stage.norm2.weight.detach().cpu().to(torch.float32).numpy().tobytes())
-                f.write(stage.w1.weight.detach().cpu().to(torch.float32).numpy().tobytes())
-                f.write(stage.w1u.weight.detach().cpu().to(torch.float32).numpy().tobytes())
-                f.write(stage.w2.weight.detach().cpu().to(torch.float32).numpy().tobytes())
+                da = stage.diff_attn
+                f.write(f32(stage.norm1.weight))
+                # conv1d.weight is [d, 1, 4] (out_ch, in_ch/groups, kernel) for a depthwise
+                # Conv1d; Rust's w_conv is (4 x d) with layout [k*d + c]. Permute (4, d).
+                conv_w = stage.conv1d.weight.detach().cpu().to(torch.float32).squeeze(1)  # [d, 4]
+                conv_w_kd = conv_w.transpose(0, 1).contiguous()  # [4, d]
+                f.write(f32(conv_w_kd))
+                f.write(f32(stage.w_gate_attn.weight))
+
+                lam = da.lambda_diff.detach().cpu().to(torch.float32)
+                f.write(int(lam.numel()).to_bytes(4, "little"))
+                f.write(f32(lam))
+                f.write(struct.pack("<f", float(da.lambda_init)))
+                f.write(struct.pack("<f", float(da.vres_gate.detach().cpu().item())))
+                f.write(f32(da.eta_rope))
+                f.write(f32(da.wq.weight))
+                f.write(f32(da.wk.weight))
+                f.write(f32(da.wv.weight))
+                f.write(f32(da.wo.weight))
+                f.write(f32(stage.norm2.weight))
+                f.write(f32(stage.w1.weight))
+                f.write(f32(stage.w1u.weight))
+                f.write(f32(stage.w2.weight))
 
             # Final norm
-            f.write(self.final_norm.weight.detach().cpu().to(torch.float32).numpy().tobytes())
+            f.write(f32(self.final_norm.weight))
 
         print(f"✓ Successfully exported TESSERA-Q weights to binary format: {path}")
+
+    @classmethod
+    def load_from_binary(cls, path: str) -> "TesseraGPUModel":
+        """
+        Round-trip loader for the format written by `export_to_binary` above (which is the
+        SAME format `TesseraModel::load_binary` in Rust reads). Lets this Python engine
+        re-load a model it just exported (or one produced by the Rust trainer/converted from
+        an open-weight model) for further CPU-side inference/fine-tuning without needing a
+        GPU. Not previously implemented in this file at all.
+        """
+        with open(path, "rb") as f:
+            def read_u32() -> int:
+                return int.from_bytes(f.read(4), "little")
+
+            def read_f32(n: int) -> torch.Tensor:
+                raw = f.read(4 * n)
+                return torch.frombuffer(bytearray(raw), dtype=torch.float32).clone()
+
+            vocab_size = read_u32()
+            d_model = read_u32()
+            d_ff = read_u32()
+            n_stages = read_u32()
+            n_heads = read_u32()
+            _adapter_rank = read_u32()
+
+            model = cls(vocab_size=vocab_size, d_model=d_model, d_ff=d_ff, n_stages=n_stages,
+                        n_heads=n_heads)
+
+            embed_flat = read_f32(vocab_size * d_model)
+            with torch.no_grad():
+                model.embeddings.weight.copy_(embed_flat.view(vocab_size, d_model))
+
+            d = d_model
+            for stage in model.stages:
+                da = stage.diff_attn
+                with torch.no_grad():
+                    stage.norm1.weight.copy_(read_f32(d))
+                    conv_kd = read_f32(4 * d).view(4, d)
+                    stage.conv1d.weight.copy_(conv_kd.transpose(0, 1).unsqueeze(1))
+                    stage.w_gate_attn.weight.copy_(read_f32(d * d).view(d, d))
+
+                    lambda_len = read_u32()
+                    lam = read_f32(lambda_len)
+                    da.lambda_diff.data = lam.clone()
+                    da.lambda_init = struct.unpack("<f", f.read(4))[0]
+                    da.vres_gate.data = torch.tensor(struct.unpack("<f", f.read(4))[0])
+                    eta_len = (d // n_heads) // 2
+                    da.eta_rope.data = read_f32(max(eta_len, 1))
+                    da.wq.weight.copy_(read_f32(d * d).view(d, d))
+                    da.wk.weight.copy_(read_f32(d * d).view(d, d))
+                    da.wv.weight.copy_(read_f32(d * d).view(d, d))
+                    da.wo.weight.copy_(read_f32(d * d).view(d, d))
+                    stage.norm2.weight.copy_(read_f32(d))
+                    stage.w1.weight.copy_(read_f32(d_ff * d).view(d_ff, d))
+                    stage.w1u.weight.copy_(read_f32(d_ff * d).view(d_ff, d))
+                    stage.w2.weight.copy_(read_f32(d * d_ff).view(d, d_ff))
+
+            with torch.no_grad():
+                model.final_norm.weight.copy_(read_f32(d))
+
+        print(f"✓ Successfully loaded TESSERA-Q weights from binary format: {path}")
+        return model
+
+    def export_to_binary_int8(self, path: str):
+        """
+        'Very optimized format': INT8 per-tensor symmetric-quantized export for weight
+        matrices (wq/wk/wv/wo/w1/w1u/w2/w_gate_attn/adapter/embeddings/mtp), alongside
+        fp32 for small vectors (norms, lambda_diff, lambda_init, vres_gate, eta_rope) where
+        quantization would be numerically unsafe for so few elements. This roughly quarters
+        the on-disk/resident size of the dominant weight matrices compared to
+        `export_to_binary`'s pure fp32 format, extending the same idea already used by the
+        existing W4A16 4-bit GPU inference kernels (`tessera_triton_60b_engine.py`) to a
+        portable, GPU-independent CPU/storage format.
+
+        File layout: same 6-u32 header as `export_to_binary`, then for every quantized
+        tensor: [f32 scale][int8 data...]; vectors are stored plain fp32 (no scale prefix).
+        This is a NEW, separate format from `export_to_binary`'s (not consumed by the
+        current Rust `load_binary`, which expects pure fp32) -- intended for space-constrained
+        storage/distribution, to be dequantized back to fp32 on load.
+        """
+        d = self.d_model
+        n_heads = self.stages[0].diff_attn.n_heads if len(self.stages) > 0 else 4
+
+        def quantize_int8(t: torch.Tensor) -> Tuple[float, bytes]:
+            t = t.detach().cpu().to(torch.float32).contiguous()
+            max_abs = t.abs().max().clamp(min=1e-8).item()
+            scale = max_abs / 127.0
+            q = torch.clamp(torch.round(t / scale), -127, 127).to(torch.int8)
+            return scale, q.numpy().tobytes()
+
+        def write_quant(f, t: torch.Tensor):
+            scale, data = quantize_int8(t)
+            f.write(struct.pack("<f", scale))
+            f.write(data)
+
+        def write_plain(f, t: torch.Tensor):
+            f.write(t.detach().cpu().contiguous().to(torch.float32).numpy().tobytes())
+
+        with open(path, "wb") as f:
+            f.write(int(self.vocab_size).to_bytes(4, "little"))
+            f.write(int(self.d_model).to_bytes(4, "little"))
+            f.write(int(self.d_ff).to_bytes(4, "little"))
+            f.write(int(len(self.stages)).to_bytes(4, "little"))
+            f.write(int(n_heads).to_bytes(4, "little"))
+            f.write(int(8).to_bytes(4, "little"))
+
+            write_quant(f, self.embeddings.weight)
+
+            for stage in self.stages:
+                da = stage.diff_attn
+                write_plain(f, stage.norm1.weight)
+                conv_w = stage.conv1d.weight.detach().cpu().to(torch.float32).squeeze(1)
+                write_plain(f, conv_w.transpose(0, 1).contiguous())
+                write_quant(f, stage.w_gate_attn.weight)
+
+                lam = da.lambda_diff.detach().cpu().to(torch.float32)
+                f.write(int(lam.numel()).to_bytes(4, "little"))
+                write_plain(f, lam)
+                f.write(struct.pack("<f", float(da.lambda_init)))
+                f.write(struct.pack("<f", float(da.vres_gate.detach().cpu().item())))
+                write_plain(f, da.eta_rope)
+                write_quant(f, da.wq.weight)
+                write_quant(f, da.wk.weight)
+                write_quant(f, da.wv.weight)
+                write_quant(f, da.wo.weight)
+                write_plain(f, stage.norm2.weight)
+                write_quant(f, stage.w1.weight)
+                write_quant(f, stage.w1u.weight)
+                write_quant(f, stage.w2.weight)
+
+            write_plain(f, self.final_norm.weight)
+
+        orig_bytes = sum(p.numel() for p in self.parameters()) * 4
+        quant_bytes = os.path.getsize(path)
+        print(
+            f"✓ Successfully exported TESSERA-Q INT8-quantized weights: {path} "
+            f"({quant_bytes / (1024*1024):.2f} MB vs {orig_bytes / (1024*1024):.2f} MB fp32, "
+            f"{quant_bytes / max(orig_bytes, 1) * 100:.1f}% of original size)"
+        )
 
 
 # =================================================================================================
