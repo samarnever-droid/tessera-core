@@ -231,10 +231,15 @@ def unpack_uint8_pairs(packed: torch.Tensor) -> torch.Tensor:
 
 def repack_gptq_uint8(qw: torch.Tensor, qz: torch.Tensor):
     """int32 8-nibble GPTQ words -> uint8 2-nibble packs via torch-verified ops.
-    Same total bytes. qw [K/8, N] -> [K/2, N]; qz [G, N/8] -> [G, N/2]."""
+    Same total bytes. qw [K/8, N] -> [K/2, N]; qz [G, N/8] -> [G/2, N/2].
+    Odd group counts (e.g. k_in < group_size -> G=1) are padded with a duplicate
+    row so row pairing works; indices still resolve because packed row j holds
+    original rows 2j (lo) and 2j+1 (hi)."""
     w4 = unpack_nibbles(qw).to(torch.uint8)
     qw8 = ((w4[1::2] << 4) | w4[0::2]).contiguous()
     z4 = unpack_zeros(qz).to(torch.uint8)
+    if z4.shape[0] % 2 == 1:
+        z4 = torch.cat([z4, z4[-1:]], dim=0)
     qz8 = ((z4[1::2] << 4) | z4[0::2]).contiguous()
     return qw8, qz8
 
