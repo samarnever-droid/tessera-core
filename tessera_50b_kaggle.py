@@ -74,6 +74,10 @@ except Exception:
 
 
 def triton_enabled(device: torch.device) -> bool:
+    # Escape hatch: TESSERA_FORCE_TORCH=1 skips the Triton path entirely
+    # (useful if Triton JIT compile thrashes on a given driver/GPU combo).
+    if os.environ.get("TESSERA_FORCE_TORCH", "0") == "1":
+        return False
     return HAS_TRITON and device.type == "cuda"
 
 
@@ -180,7 +184,9 @@ def gptq_gemv_triton(x: torch.Tensor, qw: torch.Tensor, sc: torch.Tensor,
                      qz: torch.Tensor, g_idx: torch.Tensor) -> torch.Tensor:
     K, N = qw.shape[0] * 8, sc.shape[1]
     y = torch.empty(N, device=x.device, dtype=torch.float16)
-    BLOCK_N, BLOCK_K = 128, 128
+    # 64x64 tiles: the fp32 dequant tile must fit registers on T4 (sm_75);
+    # 128x128 spills to local memory and slows every launch by orders of magnitude.
+    BLOCK_N, BLOCK_K = 64, 64
     grid = (triton.cdiv(N, BLOCK_N),)
     _gptq_gemv_kernel[grid](x, qw, sc, qz, g_idx, y, K, N,
                             BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=4)
@@ -600,6 +606,8 @@ class Tessera50BEngine:
         n_dev0 = self.split
         print(f"[tessera] {cfg.n_layers} layers: [0..{n_dev0}) on {self.dev0}, "
               f"[{n_dev0}..{cfg.n_layers}) on {self.dev1}")
+        print(f"[tessera] compute path: {'Triton INT4 GEMV' if triton_enabled(self.dev0) else 'PyTorch fallback'}"
+              f" | first call may JIT-compile (~1 min)")
         print(f"[tessera] params ≈ {cfg.param_count()/1e9:.2f}B | MRM slots: "
               f"{cfg.fine_slots}+{cfg.coarse_slots} | t_over={self.mrm.t_overwrite(cfg.d_model):.4f} "
               f"t_merge={self.mrm.t_merge(cfg.d_model):.4f}")
@@ -818,8 +826,17 @@ def smoke_test():
     eng = Tessera50BEngine(cfg)
 
     torch.manual_seed(0)
-    ids = eng.generate(prompt_ids=[1, 2, 3], max_new_tokens=8, temperature=1.0,
-                       top_k=0, top_p=1.0)
+    # stepped manually (instead of generate) so progress is visible per token
+    eng.reset()
+    ids = [1, 2, 3]
+    for t in range(8):
+        t0 = time.time()
+        logits = eng.step(ids[-1])
+        probs = sample_logits(logits, 1.0, 0, 1.0)
+        ids.append(int(torch.multinomial(probs, 1)))
+        eng.pos += 1
+        assert torch.isfinite(logits).all(), f"non-finite logits at step {t}"
+        print(f"  smoke step {t+1}/8 done in {time.time()-t0:.2f}s")
     assert all(isinstance(i, int) and 0 <= i < cfg.vocab_size for i in ids), ids
     assert eng.mrm.fine_n > 0, "MRM should have received writes"
     st = eng.mrm.status()
