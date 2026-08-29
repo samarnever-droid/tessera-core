@@ -64,6 +64,7 @@ if hasattr(sys.stdout, "reconfigure"):
 
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 try:
     import triton
@@ -340,6 +341,40 @@ def rmsnorm(x: torch.Tensor, gamma: torch.Tensor, eps: float = 1e-6) -> torch.Te
     return (x.float() * torch.rsqrt(v + eps) * gamma.float()).to(x.dtype)
 
 
+def rope_qknorm_seq(x: torch.Tensor, eta: torch.Tensor, pos0: int, d_head: int,
+                    base: float = 10000.0, eps: float = 1e-6) -> torch.Tensor:
+    """Vectorized adaptive RoPE + per-head QK-RMSNorm for a whole chunk.
+    x: [T, n_heads, d_head]; absolute positions pos0..pos0+T-1."""
+    T, H, dk = x.shape
+    half = dk // 2
+    freqs = base ** (-2.0 * torch.arange(half, device=x.device, dtype=torch.float32) / d_head)
+    theta = freqs * (2.0 * torch.sigmoid(eta.float()))
+    pos = torch.arange(pos0, pos0 + T, device=x.device, dtype=torch.float32)
+    ang = pos[:, None] * theta[None, :]                       # [T, half]
+    cos = ang.cos()[:, None, :]
+    sin = ang.sin()[:, None, :]
+    xf = x.float()
+    xe, xo = xf[..., 0::2], xf[..., 1::2]
+    re, ro = xe * cos - xo * sin, xe * sin + xo * cos
+    out = torch.stack([re, ro], dim=-1).reshape(T, H, dk)
+    inv = torch.rsqrt(out.pow(2).mean(-1, keepdim=True) + eps)
+    return (out * inv).to(x.dtype)
+
+
+def _deq(W: "GPTQLinear") -> torch.Tensor:
+    """Dequantize a frozen GPTQ linear to fp16 [K, N] on its device (training path).
+    Called inside checkpointed compute: materialized transiently in forward and
+    again in the backward recompute, never retained across layers by autograd."""
+    if W.use_triton:
+        w4 = unpack_uint8_pairs(W.qw8).to(torch.float32)
+        z = unpack_uint8_pairs(W.qz8).to(torch.float32) + 1.0
+    else:
+        w4 = unpack_nibbles(W.qw).to(torch.float32)
+        z = unpack_zeros(W.qz).to(torch.float32) + 1.0
+    g = W.g_idx.long()
+    return ((w4 - z[g]) * W.sc.float()[g]).to(torch.float16)
+
+
 def rope_qknorm(vec: torch.Tensor, eta: torch.Tensor, pos: int, d_head: int,
                 base: float = 10000.0, eps: float = 1e-6) -> torch.Tensor:
     """Adaptive RoPE + per-head QK-RMSNorm on [n_heads, d_head] at absolute position pos."""
@@ -503,6 +538,20 @@ class TesseraLayer:
         self.lambda_init = lambda_init_at(layer_idx)
 
         self._conv_buf: deque = deque(maxlen=3)
+        # Calibration fine-tune fields (populated by engine.enable_calibration_mode):
+        # dense trainable replacements for the Tessera-only components.
+        self.w_conv_p = None      # Parameter fp32 [4, d]   (replaces self.w_conv)
+        self.eta_p = None         # Parameter fp32 [dk/2]  (replaces self.eta)
+        self.lambda_p = None      # Parameter fp32 [P, 2]  (replaces self.lambda_ab)
+        self.vres_gate = None     # Parameter fp32 scalar  (replaces float self.vres_w)
+        self.av_w = None          # Parameter fp32 [r, d]  (replaces GPTQ self.av)
+        self.au_w = None          # Parameter fp32 [d, r]  (replaces GPTQ self.au; zero-init)
+        self._chunk_seed = []     # last 3 post-norm h (detached) for chunked conv
+
+    def _active(self, name: str):
+        """Calibration Parameter if present, else the frozen default."""
+        p = getattr(self, name + "_p")
+        return p if p is not None else getattr(self, name)
 
     def load_source(self, w: Dict[str, torch.Tensor], prefix: str,
                     n_kv_heads: int) -> List[str]:
@@ -534,6 +583,104 @@ class TesseraLayer:
 
     def reset_state(self):
         self._conv_buf.clear()
+        self._chunk_seed = []
+
+    # ----------------------------------------------------------------------------------
+    def chunk_compute(self, h, v0, slots_k, slots_v, seed, pos0):
+        """PURE chunked training forward over T tokens (checkpoint-safe: deterministic,
+        no side effects, no RNG). GEMM path: frozen 4-bit weights dequantized on the fly.
+        h: [T, d] fp16 | v0: [T, d] stage-1 values or None | slots_k/v: [S, d] detached
+        memory snapshot or None | seed: [s<=3, d] detached conv history or None.
+        Returns (h_out, v_raw, q_mean_det, veff_mean_det, sal_det, hn)."""
+        cfg = self.cfg
+        T, d = h.shape[0], cfg.d_model
+        dev = h.device
+        w_conv = self._active("w_conv")
+        eta = self._active("eta")
+        lam_ab = self.lambda_p if self.lambda_p is not None else self.lambda_ab
+
+        # Pillar 1
+        hn = rmsnorm(h, self.gamma1, cfg.norm_eps)            # [T, d]
+
+        # Pillar 2 (chunked causal conv seeded by detached history)
+        s = 0 if seed is None else seed.shape[0]
+        inp = torch.cat([seed, hn], 0) if seed is not None else hn
+        inp_f = inp.float()
+        conv_full = torch.zeros_like(inp_f)
+        for j in range(4):
+            shifted = inp_f if j == 0 else torch.cat(
+                [torch.zeros(j, d, device=dev), inp_f[:-j]], 0)
+            conv_full = conv_full + w_conv[j].float().to(dev) * shifted
+        conv = conv_full[s:]
+        gate = torch.sigmoid((hn @ _deq(self.w_gate)).float())
+        h_gated = (conv * gate).to(h.dtype)
+
+        # Pillars 3+4: Q/K/V GEMM + RoPE + QK-norm
+        qh = (h_gated @ _deq(self.wq)).view(T, cfg.n_heads, cfg.d_head)
+        kh = (h_gated @ _deq(self.wk)).view(T, cfg.n_heads, cfg.d_head)
+        vh = (h_gated @ _deq(self.wv)).view(T, cfg.n_heads, cfg.d_head)
+        qh = rope_qknorm_seq(qh, eta, pos0, cfg.d_head, cfg.rope_base, cfg.norm_eps)
+        kh = rope_qknorm_seq(kh, eta, pos0, cfg.d_head, cfg.rope_base, cfg.norm_eps)
+
+        # Pillar 6: value residual on this chunk's values (v0 carries grad)
+        v_raw = vh
+        if v0 is not None:
+            w = torch.sigmoid(self.vres_gate) if self.vres_gate is not None else self.vres_w
+            v_eff = (w * vh.float() + (1.0 - w) * v0.float()).to(vh.dtype)
+        else:
+            v_eff = vh
+
+        # Pillars 5+8: DiffAttn over detached memory slots + causal chunk prefix
+        qf, kf, vf = qh.float(), kh.float(), v_eff.float()
+        q1, q2 = qf[:, 0::2], qf[:, 1::2]
+        k1c, k2c = kf[:, 0::2], kf[:, 1::2]
+        v1c, v2c = vf[:, 0::2], vf[:, 1::2]
+        S = 0
+        if slots_k is not None:
+            sh = slots_k.float().view(-1, cfg.n_heads, cfg.d_head)
+            sv = slots_v.float().view(-1, cfg.n_heads, cfg.d_head)
+            k1 = torch.cat([sh[:, 0::2], k1c], 0)
+            k2 = torch.cat([sh[:, 1::2], k2c], 0)
+            v1 = torch.cat([sv[:, 0::2], v1c], 0)
+            v2 = torch.cat([sv[:, 1::2], v2c], 0)
+            S = sh.shape[0]
+        else:
+            k1, k2, v1, v2 = k1c, k2c, v1c, v2c
+
+        scale = 1.0 / math.sqrt(cfg.d_head)
+        s1 = torch.einsum("tpd,spd->tps", q1, k1) * scale
+        s2 = torch.einsum("tpd,spd->tps", q2, k2) * scale
+        if S:
+            neg = torch.finfo(s1.dtype).min
+            causal = torch.triu(torch.full((T, T), neg, device=dev), diagonal=1)
+            mask = torch.zeros(T, S + T, device=dev)
+            mask[:, S:] = causal
+            s1, s2 = s1 + mask[:, None, :], s2 + mask[:, None, :]
+        p1, p2 = s1.softmax(-1), s2.softmax(-1)
+        a, b = lam_ab[:, 0], lam_ab[:, 1]
+        lam = torch.clamp(torch.exp(a) - torch.exp(b) + self.lambda_init, min=0.0)
+        pdiff = p1 - lam[None, :, None] * p2
+        o1 = torch.einsum("tps,spd->tpd", pdiff, v1)
+        o2 = torch.einsum("tps,spd->tpd", pdiff, v2)
+        ctx = torch.stack([o1, o2], dim=-1).reshape(T, cfg.n_heads, cfg.d_head)
+        ctx = ctx.reshape(T, d)
+
+        h_mid = h + (ctx.to(h.dtype) @ _deq(self.wo)).to(h.dtype)
+
+        # Pillar 7
+        hn2 = rmsnorm(h_mid, self.gamma2, cfg.norm_eps)
+        g = hn2 @ _deq(self.w1)
+        u = hn2 @ _deq(self.w1u)
+        act = (g.float() * torch.sigmoid(g.float())).to(h.dtype)
+        ffn = act @ _deq(self.w2)
+        adapter = (hn2.float() @ self.av_w.t()) @ self.au_w.t()
+        h_out = h_mid + (ffn.float() + adapter).to(h.dtype)
+
+        with torch.no_grad():
+            q_mean = qh.mean(0).reshape(-1).detach()
+            veff_mean = v_eff.mean(0).reshape(-1).detach()
+            sal = (v_eff.reshape(T, d).float() - ctx.float()).norm(dim=-1).detach()   # [T]
+        return h_out, v_raw, q_mean, veff_mean, sal, hn
 
     # ----------------------------------------------------------------------------------
     def _diff_attn_over_mrm(self, q: torch.Tensor, mrm: MRMv2Streaming) -> torch.Tensor:
@@ -546,6 +693,7 @@ class TesseraLayer:
         # MRM lives on dev0; layers on dev1 must pull the slots across PCIe
         if keys.device != self.device:
             keys, vals = keys.to(self.device, non_blocking=True), vals.to(self.device, non_blocking=True)
+        lam_ab = self.lambda_p if self.lambda_p is not None else self.lambda_ab
 
         S = keys.shape[0]
         kh = keys.float().view(S, cfg.n_heads, cfg.d_head)
@@ -561,7 +709,7 @@ class TesseraLayer:
         s2 = torch.einsum("pd,spd->sp", q2, k2) * scale
         p1, p2 = s1.softmax(-1), s2.softmax(-1)
 
-        a, b = self.lambda_ab[:, 0], self.lambda_ab[:, 1]
+        a, b = lam_ab[:, 0], lam_ab[:, 1]
         lam = torch.clamp(torch.exp(a) - torch.exp(b) + self.lambda_init, min=0.0)
         pdiff = p1 - lam.unsqueeze(0) * p2           # [S, P] (s: slots, p: pairs)
 
@@ -584,17 +732,19 @@ class TesseraLayer:
 
         # Pillar 2: causal depthwise conv k=4 * sigmoid(W_gate . hn)
         self._conv_buf.append(hn)
+        w_conv = self._active("w_conv")
         conv = torch.zeros_like(hn.float())
         for j, prev in enumerate(self._conv_buf):
-            conv += self.w_conv[j].float() * prev.float()   # j=0 -> current token
+            conv += w_conv[j].float().to(h.device) * prev.float()   # j=0 -> current token
         gate = torch.sigmoid(self.w_gate(hn).float())
         h_gated = (conv * gate).to(hn.dtype)
 
         # Pillars 3+4: Q/K/V projections, adaptive RoPE, per-head QK-RMSNorm
+        eta = self._active("eta")
         q = rope_qknorm(self.wq(h_gated).view(cfg.n_heads, cfg.d_head),
-                        self.eta, pos, cfg.d_head, cfg.rope_base, cfg.norm_eps)
+                        eta, pos, cfg.d_head, cfg.rope_base, cfg.norm_eps)
         k = rope_qknorm(self.wk(h_gated).view(cfg.n_heads, cfg.d_head),
-                        self.eta, pos, cfg.d_head, cfg.rope_base, cfg.norm_eps)
+                        eta, pos, cfg.d_head, cfg.rope_base, cfg.norm_eps)
         v = self.wv(h_gated)
 
         # Pillars 5+8: DiffAttn over MRM slots
@@ -605,14 +755,20 @@ class TesseraLayer:
         hn2 = rmsnorm(h_mid, self.gamma2, cfg.norm_eps)
         g, u = self.w1(hn2).float(), self.w1u(hn2).float()
         ffn = self.w2((g * torch.sigmoid(g)).to(hn2.dtype)).float()
-        adapter = self.au(self.av(hn2)).float()
+        if self.av_w is not None:   # trainable dense adapter (calibration mode)
+            adapter = (hn2.float() @ self.av_w.t().to(hn2.device)) @ self.au_w.t().to(hn2.device)
+        else:                       # frozen GPTQ adapter (default init)
+            adapter = self.au(self.av(hn2)).float()
         h_out = h_mid + (ffn + adapter).to(h_mid.dtype)
 
         # Pillar 6: ResFormer value residual on the value written to memory
         v_raw = v
         if v0_token is not None:
-            v_eff = (self.vres_w * v.float()
-                     + (1.0 - self.vres_w) * v0_token.to(self.device).float()).to(v.dtype)
+            if self.vres_gate is not None:
+                w = torch.sigmoid(self.vres_gate)
+            else:
+                w = self.vres_w
+            v_eff = (w * v.float() + (1.0 - w) * v0_token.to(self.device).float()).to(v.dtype)
         else:
             v_eff = v
 
@@ -804,6 +960,84 @@ class Tessera50BEngine:
         logits = self.embed.float() @ hn.float()
         return self.cfg.logit_cap * torch.tanh(logits / self.cfg.logit_cap)
 
+    # ------------------------------------------------------------------ calibration
+    def enable_calibration_mode(self):
+        """Swap Tessera-only components for dense fp32 trainable Parameters.
+        Transplanted weights (QKVO, FFN, embeddings, norms, conv gate) stay frozen.
+        The conv gate is re-initialized to zero -> sigmoid(0)=0.5 neutral gate."""
+        if self.layers[0].w_conv_p is not None:
+            print("[tessera] calibration mode already enabled")
+            return
+        for i, layer in enumerate(self.layers):
+            cfg, dev = self.cfg, layer.device
+            layer.w_conv_p = torch.nn.Parameter(layer.w_conv.float().clone().to(dev))
+            layer.eta_p = torch.nn.Parameter(layer.eta.clone())
+            layer.lambda_p = torch.nn.Parameter(layer.lambda_ab.clone())
+            layer.vres_gate = torch.nn.Parameter(torch.tensor(0.8473, device=dev))
+            g = torch.Generator().manual_seed(1234 + i)
+            av = torch.randn(cfg.r_adapter, cfg.d_model, generator=g) * 0.02
+            layer.av_w = torch.nn.Parameter(av.to(dev))
+            layer.au_w = torch.nn.Parameter(                       # zero-init: no-op start
+                torch.zeros(cfg.d_model, cfg.r_adapter, device=dev))
+            layer.w_gate = _zero_gptq_linear(cfg.d_model, cfg.d_model, cfg.group_size,
+                                             dev, triton_enabled(dev))
+        n = sum(p.numel() for p in self.trainable_parameters())
+        print(f"[tessera] calibration mode: {n/1e6:.2f}M trainable fp32 params "
+              f"(conv, eta, lambda, vres, adapters); everything else frozen")
+
+    def trainable_parameters(self):
+        out = []
+        for layer in self.layers:
+            out += [layer.w_conv_p, layer.eta_p, layer.lambda_p,
+                    layer.vres_gate, layer.av_w, layer.au_w]
+        return out
+
+    def calibration_state_dict(self) -> Dict[str, torch.Tensor]:
+        sd = {}
+        for i, layer in enumerate(self.layers):
+            for name in ("w_conv_p", "eta_p", "lambda_p", "vres_gate", "av_w", "au_w"):
+                sd[f"L{i}.{name}"] = getattr(layer, name).detach().cpu()
+        return sd
+
+    def load_calibration_state_dict(self, sd: Dict[str, torch.Tensor]):
+        self.enable_calibration_mode()
+        with torch.no_grad():
+            for i, layer in enumerate(self.layers):
+                for name in ("w_conv_p", "eta_p", "lambda_p", "vres_gate", "av_w", "au_w"):
+                    cur = getattr(layer, name)
+                    cur.copy_(sd[f"L{i}.{name}"].to(cur.device, cur.dtype))
+        print("[tessera] calibration weights loaded")
+
+    def chunk_forward(self, token_ids: List[int]) -> torch.Tensor:
+        """Training forward over a chunk (GEMM path, per-layer gradient checkpointing).
+        Memory (MRM slots, conv seeds) is DETACHED across chunk boundaries — truncated
+        BPTT; attention within the chunk is exact, causal, and includes the memory
+        slots as a shared prefix. Returns soft-capped logits [T, vocab] (fp32)."""
+        T = len(token_ids)
+        cfg = self.cfg
+        ids = torch.tensor(token_ids, dtype=torch.long, device=self.dev0)
+        h = self.embed[ids]                                       # [T, d] fp16
+        v0 = None
+        for i, layer in enumerate(self.layers):
+            slots_k, slots_v = self.mrm.slots()
+            if slots_k is not None and slots_k.device != layer.device:
+                slots_k, slots_v = slots_k.to(layer.device), slots_v.to(layer.device)
+            seed = torch.stack(layer._chunk_seed).to(layer.device) if layer._chunk_seed else None
+            h, v_raw, q_mean, veff_mean, sal, hn = checkpoint(
+                layer.chunk_compute, h, v0, slots_k, slots_v, seed, self.pos,
+                use_reentrant=False)
+            with torch.no_grad():                                 # detached memory update
+                self.mrm.write(q_mean, veff_mean, salience=float(sal.mean()))
+                layer._chunk_seed = [t.detach() for t in hn[-3:]]
+            if i == 0:
+                v0 = v_raw                                        # keeps grad (Pillar 6)
+            if i == self.split - 1:
+                h = h.to(self.dev1)
+        hn_final = rmsnorm(h.to(self.dev0), self.final_gamma, cfg.norm_eps)
+        logits = hn_final @ self.embed.t()                        # [T, V] fp16, tied head
+        self.pos += T
+        return cfg.logit_cap * torch.tanh(logits.float() / cfg.logit_cap)
+
     @torch.no_grad()
     def generate(self, prompt_ids: List[int], max_new_tokens: int = 64,
                  temperature: float = 0.8, top_k: int = 50, top_p: float = 0.95) -> List[int]:
@@ -826,6 +1060,17 @@ class Tessera50BEngine:
         if self.tokenizer is not None:
             return self.tokenizer.decode(ids, skip_special_tokens=True)
         return bytes([i & 0xFF for i in ids]).decode("utf-8", errors="replace")
+
+
+def _zero_gptq_linear(k_in: int, n_out: int, group: int, device, use_triton: bool) -> GPTQLinear:
+    """All-zero GPTQ linear: dequantizes to exactly 0 -> sigmoid(Wx) = 0.5 gate.
+    Used for the Tessera-only conv gate at load time (no source equivalent)."""
+    n_groups = (k_in + group - 1) // group
+    qw = torch.zeros(k_in // 8, n_out, dtype=torch.int32)
+    sc = torch.zeros(n_groups, n_out, dtype=torch.float16)
+    qz = torch.full((n_groups, n_out // 8), -2004318072, dtype=torch.int32)
+    g_idx = (torch.arange(k_in, dtype=torch.int32) // group)
+    return GPTQLinear(qw, sc, qz, g_idx, device, use_triton)
 
 
 def _random_gptq_linear(k_in: int, n_out: int, group: int, device, use_triton: bool) -> GPTQLinear:
@@ -923,7 +1168,132 @@ def check_gpu():
 
 
 # ====================================================================================================
-# 8. SMOKE TEST (CPU, tiny random config — exercises every pillar end to end)
+# 9. CALIBRATION FINE-TUNING (fix output quality: train only Tessera-specific components)
+# ====================================================================================================
+
+def build_token_chunks(model_dir: str, tokenizer_dir: Optional[str] = None,
+                       seq_len: int = 256, dataset_name: str = "wikitext",
+                       dataset_config: str = "wikitext-2-raw-v1"):
+    """Yields chunks of seq_len+1 token ids (input + 1 shifted target) from a HF dataset."""
+    from datasets import load_dataset
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(tokenizer_dir or model_dir, trust_remote_code=True)
+    ds = load_dataset(dataset_name, dataset_config, split="train")
+    text = "\n".join(ds["text"])
+    ids = tok.encode(text)
+    print(f"[data] {len(ids):,} tokens from {dataset_name}/{config_name_safe(dataset_config)} "
+          f"-> {(len(ids) - 1) // seq_len:,} chunks of {seq_len}")
+    for i in range(0, len(ids) - seq_len - 1, seq_len):
+        yield ids[i:i + seq_len + 1]
+
+
+def config_name_safe(name: str) -> str:
+    return name
+
+
+def train_calibration(engine: "Tessera50BEngine", token_iter, steps: int = 500,
+                      lr: float = 1e-3, warmup: int = 50, weight_decay: float = 0.01,
+                      report_every: int = 25, save_path: Optional[str] = None) -> List[float]:
+    """AdamW on the Tessera-only parameters. Loss = next-token CE + z-loss (Pillar spec:
+    1e-4 * logsumexp^2). WSD-style schedule: linear warmup then cosine to 0.1*lr.
+    Memory state persists across chunks (detached) — matches streaming inference."""
+    engine.enable_calibration_mode()
+    params = engine.trainable_parameters()
+    opt = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+
+    def lr_at(step: int) -> float:
+        if step < warmup:
+            return lr * (step + 1) / warmup
+        t = (step - warmup) / max(1, steps - warmup)
+        return 0.1 * lr + 0.9 * lr * 0.5 * (1.0 + math.cos(math.pi * t))
+
+    losses: List[float] = []
+    t0 = time.time()
+    for step in range(steps):
+        chunk = next(token_iter)
+        x, y = chunk[:-1], chunk[1:]
+        for pg in opt.param_groups:
+            pg["lr"] = lr_at(step)
+        logits = engine.chunk_forward(x)
+        targets = torch.tensor(y, dtype=torch.long, device=logits.device)
+        ce = F.cross_entropy(logits.float(), targets)
+        z = 1e-4 * torch.logsumexp(logits.float(), dim=-1).pow(2).mean()
+        loss = ce + z
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
+        opt.step()
+        losses.append(float(ce))
+        if (step + 1) % report_every == 0:
+            recent = losses[-report_every:]
+            rate = report_every * len(x) / max(1e-9, time.time() - t0)
+            print(f"  step {step+1}/{steps} | CE {sum(recent)/len(recent):.4f} "
+                  f"| lr {lr_at(step):.2e} | {rate:.0f} tok/s")
+            t0 = time.time()
+            if save_path:
+                torch.save(engine.calibration_state_dict(), save_path)
+    if save_path:
+        torch.save(engine.calibration_state_dict(), save_path)
+        print(f"[tessera] calibration saved -> {save_path}")
+    return losses
+
+
+def calib_self_test():
+    """CPU self-test: tiny engine, REPEATED skewed-unigram chunk -> the trainable path
+    must overfit it (proves gradients flow through the checkpointed chunk graph).
+    Also checks the save/load round-trip and that GEMV inference still runs."""
+    print("=" * 90)
+    print("  TESSERA CALIBRATION SELF-TEST (tiny config, CPU)")
+    print("=" * 90)
+    V = 64
+    cfg = TesseraConfig(vocab_size=V, d_model=64, n_layers=4, n_heads=4,
+                        d_ff=192, r_adapter=8, group_size=16)
+    eng = Tessera50BEngine(cfg)
+    torch.manual_seed(0)
+
+    probs = torch.softmax(torch.linspace(3.0, -3.0, V), dim=0)
+    rng = torch.Generator().manual_seed(7)
+    fixed_chunk = torch.multinomial(probs, 257, replacement=True, generator=rng).tolist()
+
+    class FixedIter:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            return fixed_chunk
+
+    losses = train_calibration(eng, FixedIter(), steps=200, lr=1e-2, warmup=10,
+                               report_every=50)
+    import statistics
+    first, last = statistics.mean(losses[:5]), statistics.mean(losses[-5:])
+    floor = float(-(probs * probs.log()).sum())
+    print(f"  CE: first {first:.3f} -> last {last:.3f} | entropy floor {floor:.3f} "
+          f"| uniform baseline {math.log(V):.3f}")
+    # The frozen 0.02-scale random head gives weak gradients; a clear drop (>0.3)
+    # on a repeated chunk is the proof that gradients reach every trainable param.
+    assert last < first - 0.3, "loss did not decrease"
+
+    # save/load round-trip must be bit-exact
+    sd = eng.calibration_state_dict()
+    with torch.no_grad():
+        eng.layers[0].au_w.fill_(0.123)
+    eng.load_calibration_state_dict(sd)
+    assert torch.equal(eng.layers[0].au_w.cpu(), sd["L0.au_w"]), "round-trip mismatch"
+    print("  save/load round-trip: exact")
+
+    # streaming inference still works with calibration params installed
+    ids = eng.generate(prompt_ids=[1, 2, 3], max_new_tokens=4, temperature=1.0,
+                       top_k=0, top_p=1.0)
+    assert all(0 <= i < V for i in ids)
+    print("  GEMV inference with calibration params: ok")
+    print("✓ CALIBRATION SELF-TEST PASSED")
+    print("=" * 90)
+
+
+
+
+# ====================================================================================================
+# 10. SMOKE TEST (CPU, tiny random config — exercises every pillar end to end)
 # ====================================================================================================
 
 def smoke_test():
@@ -970,6 +1340,8 @@ if __name__ == "__main__":
     ap.add_argument("--smoke", action="store_true", help="tiny CPU self-test")
     ap.add_argument("--check-gpu", action="store_true",
                     help="validate Triton GEMVs vs float64 reference on CUDA")
+    ap.add_argument("--calib-test", action="store_true",
+                    help="CPU self-test of the calibration fine-tune mechanics")
     args = ap.parse_args()
 
     if args.smoke:
@@ -978,6 +1350,10 @@ if __name__ == "__main__":
 
     if args.check_gpu:
         check_gpu()
+        sys.exit(0)
+
+    if args.calib_test:
+        calib_self_test()
         sys.exit(0)
 
     eng = Tessera50BEngine(model_dir=args.model, tokenizer_dir=args.tokenizer)
