@@ -625,6 +625,7 @@ class TesseraLayer:
         # Pillar 6: value residual on this chunk's values (v0 carries grad)
         v_raw = vh
         if v0 is not None:
+            v0 = v0.to(h.device)   # stage-1 values live on dev0; dev1 layers must pull them
             w = torch.sigmoid(self.vres_gate) if self.vres_gate is not None else self.vres_w
             v_eff = (w * vh.float() + (1.0 - w) * v0.float()).to(vh.dtype)
         else:
