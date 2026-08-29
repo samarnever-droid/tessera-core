@@ -822,6 +822,7 @@ class Tessera50BEngine:
         else:
             self._random_init()
 
+        cfg = self.cfg  # the loader may have replaced it with the source model's config
         n_dev0 = self.split
         print(f"[tessera] {cfg.n_layers} layers: [0..{n_dev0}) on {self.dev0}, "
               f"[{n_dev0}..{cfg.n_layers}) on {self.dev1}")
@@ -922,6 +923,13 @@ class Tessera50BEngine:
             layer.vres_w = 1.0 / (1.0 + math.exp(-0.8473))
             layer.lambda_init = lambda_init_at(i)
             layer._conv_buf = deque(maxlen=3)
+            layer.w_conv_p = None      # calibration fields (see TesseraLayer.__init__)
+            layer.eta_p = None
+            layer.lambda_p = None
+            layer.vres_gate = None
+            layer.av_w = None
+            layer.au_w = None
+            layer._chunk_seed = []
             use_tri = triton_enabled(dev)
 
             def gp(name, k_in, n_out, ungroup=False):
