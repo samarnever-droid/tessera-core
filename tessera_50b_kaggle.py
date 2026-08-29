@@ -137,12 +137,15 @@ if HAS_TRITON:
 
     @triton.jit
     def _gptq_gemv_kernel(
-        X_ptr, QW_ptr, SC_ptr, QZ_ptr, GIDX_ptr, Y_ptr,
+        X_ptr, QW8_ptr, SC_ptr, QZ8_ptr, GIDX_ptr, Y_ptr,
         K, N,
         BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     ):
         """Fused INT4-GPTQ GEMV for M=1 decode.
-        w[k, n] = (nibble(qw[k//8, n], k%8) - (nibble(qz[g, n//8], n%8) + 1)) * sc[g, n],
+        Weights/zeros are uint8 2-nibble packs (low nibble = even index), the same
+        convention as the repo's proven 60B engine. We deliberately avoid int32
+        8-nibble word shifts — they misbehave on some sm_75 Triton backends.
+        w[k, n] = (nibble8(qw8[k//2, n], k%2) - (nibble8(qz8[g, n//2], n%2) + 1)) * sc[g, n],
         g = g_idx[k]  (auto-gptq convention: unpacked zero is stored minus 1)."""
         pid_n = tl.program_id(0)
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -157,22 +160,24 @@ if HAS_TRITON:
 
             gidx = tl.load(GIDX_ptr + offs_k, mask=mask_k, other=0)
 
-            qw = tl.load(
-                QW_ptr + (offs_k[:, None] // 8) * N + offs_n[None, :],
+            kb = tl.load(
+                QW8_ptr + (offs_k[:, None] // 2) * N + offs_n[None, :],
                 mask=mask_k[:, None] & mask_n[None, :], other=0,
             )
-            w4 = ((qw >> ((offs_k[:, None] % 8) * 4)) & 0xF).to(tl.float32)
+            w4 = tl.where((offs_k[:, None] & 1) == 1,
+                          (kb >> 4) & 0xF, kb & 0xF).to(tl.float32)
 
             sc = tl.load(
                 SC_ptr + gidx[:, None] * N + offs_n[None, :],
                 mask=mask_k[:, None] & mask_n[None, :], other=0.0,
             ).to(tl.float32)
 
-            qz = tl.load(
-                QZ_ptr + gidx[:, None] * (N // 8) + (offs_n[None, :] // 8),
+            zb = tl.load(
+                QZ8_ptr + gidx[:, None] * (N // 2) + (offs_n[None, :] // 2),
                 mask=mask_k[:, None] & mask_n[None, :], other=0,
             )
-            z4 = (((qz >> ((offs_n[None, :] % 8) * 4)) & 0xF).to(tl.float32)) + 1.0
+            z4 = tl.where((offs_n[None, :] & 1) == 1,
+                          (zb >> 4) & 0xF, zb & 0xF).to(tl.float32) + 1.0
 
             w = (w4 - z4) * sc
             acc += tl.sum(x[:, None] * w, axis=0)
@@ -180,15 +185,15 @@ if HAS_TRITON:
         tl.store(Y_ptr + offs_n, acc.to(tl.float16), mask=mask_n)
 
 
-def gptq_gemv_triton(x: torch.Tensor, qw: torch.Tensor, sc: torch.Tensor,
-                     qz: torch.Tensor, g_idx: torch.Tensor) -> torch.Tensor:
-    K, N = qw.shape[0] * 8, sc.shape[1]
+def gptq_gemv_triton(x: torch.Tensor, qw8: torch.Tensor, sc: torch.Tensor,
+                     qz8: torch.Tensor, g_idx: torch.Tensor) -> torch.Tensor:
+    K, N = qw8.shape[0] * 2, sc.shape[1]
     y = torch.empty(N, device=x.device, dtype=torch.float16)
     # 64x64 tiles: the fp32 dequant tile must fit registers on T4 (sm_75);
     # 128x128 spills to local memory and slows every launch by orders of magnitude.
     BLOCK_N, BLOCK_K = 64, 64
     grid = (triton.cdiv(N, BLOCK_N),)
-    _gptq_gemv_kernel[grid](x, qw, sc, qz, g_idx, y, K, N,
+    _gptq_gemv_kernel[grid](x, qw8, sc, qz8, g_idx, y, K, N,
                             BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=4)
     return y
 
@@ -213,6 +218,27 @@ def unpack_zeros(qz: torch.Tensor) -> torch.Tensor:
     return out.reshape(g, n8 * 8)
 
 
+def unpack_uint8_pairs(packed: torch.Tensor) -> torch.Tensor:
+    """uint8 2-nibble bytes [R, C] (low nibble = even index) -> int16 [2R, C]."""
+    lo = (packed & 0xF).to(torch.int16)
+    hi = ((packed >> 4) & 0xF).to(torch.int16)
+    out = torch.empty(packed.shape[0] * 2, packed.shape[1], dtype=torch.int16,
+                      device=packed.device)
+    out[0::2] = lo
+    out[1::2] = hi
+    return out
+
+
+def repack_gptq_uint8(qw: torch.Tensor, qz: torch.Tensor):
+    """int32 8-nibble GPTQ words -> uint8 2-nibble packs via torch-verified ops.
+    Same total bytes. qw [K/8, N] -> [K/2, N]; qz [G, N/8] -> [G, N/2]."""
+    w4 = unpack_nibbles(qw).to(torch.uint8)
+    qw8 = ((w4[1::2] << 4) | w4[0::2]).contiguous()
+    z4 = unpack_zeros(qz).to(torch.uint8)
+    qz8 = ((z4[1::2] << 4) | z4[0::2]).contiguous()
+    return qw8, qz8
+
+
 def dequant_gptq(qw: torch.Tensor, sc: torch.Tensor, qz: torch.Tensor,
                  g_idx: torch.Tensor, chunk: int = 512) -> torch.Tensor:
     """Dequantize a GPTQ tensor to fp16, chunked over K to bound memory."""
@@ -229,21 +255,30 @@ def dequant_gptq(qw: torch.Tensor, sc: torch.Tensor, qz: torch.Tensor,
 
 
 class GPTQLinear:
-    """4-bit GPTQ GEMV layer. Triton fast path, chunked torch fallback."""
+    """4-bit GPTQ GEMV layer. Triton fast path (uint8 2-nibble packs),
+    chunked torch fallback (int32 words)."""
 
     def __init__(self, qw: torch.Tensor, sc: torch.Tensor, qz: torch.Tensor,
                  g_idx: torch.Tensor, device: torch.device, use_triton: bool):
-        self.qw = qw.to(device)
+        self.use_triton = use_triton and triton_enabled(device)
+        if self.use_triton:
+            # Triton path: repack to uint8 2-nibble form and DROP the int32 words
+            # (keeping both would double weight memory).
+            self.qw8, self.qz8 = repack_gptq_uint8(qw, qz)
+            self.qw8, self.qz8 = self.qw8.to(device), self.qz8.to(device)
+            self.qw, self.qz = None, None
+        else:
+            self.qw, self.qz = qw.to(device), qz.to(device)
+            self.qw8, self.qz8 = None, None
         self.sc = sc.to(device)
-        self.qz = qz.to(device)
         self.g_idx = g_idx.to(device)
         self.device = device
-        self.use_triton = use_triton and triton_enabled(device)
         self.out_features = sc.shape[1]
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if self.use_triton:
-            return gptq_gemv_triton(x.to(self.device), self.qw, self.sc, self.qz, self.g_idx)
+            return gptq_gemv_triton(x.to(self.device), self.qw8, self.sc,
+                                    self.qz8, self.g_idx)
         # Fallback: dequantize chunk-by-chunk and matvec (exact, slow).
         N = self.sc.shape[1]
         y = torch.zeros(N, dtype=torch.float32, device=self.device)  # MUST be zeros: += accumulates
@@ -259,7 +294,9 @@ class GPTQLinear:
         return y.to(torch.float16)
 
     def memory_bytes(self) -> int:
-        return self.qw.numel() + self.sc.numel() * 2 + self.qz.numel() + self.g_idx.numel() * 4
+        packed = self.qw8 if self.use_triton else self.qw
+        zeros = self.qz8 if self.use_triton else self.qz
+        return packed.numel() + self.sc.numel() * 2 + zeros.numel() + self.g_idx.numel() * 4
 
 
 def repack_nibbles(w4: torch.Tensor) -> torch.Tensor:
@@ -838,14 +875,19 @@ def check_gpu():
     for li, layer in enumerate(eng.layers):
         for name in ("w_gate", "wq", "wk", "wv", "wo", "w1", "w1u", "w2", "av", "au"):
             W = getattr(layer, name)
-            K = W.qw.shape[0] * 8
+            K = W.qw8.shape[0] * 2 if W.use_triton else W.qw.shape[0] * 8
             x = (torch.randn(K, device=W.device, dtype=torch.float16) * 0.5)
             if W.use_triton:
-                y_tri = gptq_gemv_triton(x, W.qw, W.sc, W.qz, W.g_idx).float()
+                y_tri = gptq_gemv_triton(x, W.qw8, W.sc, W.qz8, W.g_idx).float()
+                # float32 reference from the same uint8 packs, via torch-verified ops
+                w4 = unpack_uint8_pairs(W.qw8).float()
+                z4 = unpack_uint8_pairs(W.qz8).float() + 1.0
+                g = W.g_idx.long()
+                w_ref = (w4 - z4[g]) * W.sc.float()[g]
             else:
                 y_tri = W(x).float()
-            w_ref = dequant_gptq(W.qw.cpu(), W.sc.cpu(), W.qz.cpu(), W.g_idx.cpu().long()) \
-                .to(W.device).float()
+                w_ref = dequant_gptq(W.qw.cpu(), W.sc.cpu(), W.qz.cpu(),
+                                     W.g_idx.cpu().long()).to(W.device).float()
             y_ref = w_ref.t() @ x.float()
             diff = (y_tri - y_ref).abs().max().item()
             finite = torch.isfinite(y_tri).all().item()
