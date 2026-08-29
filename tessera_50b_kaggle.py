@@ -843,6 +843,18 @@ class Tessera50BEngine:
     def _load_from_hf_gptq(self, model_dir: str, tokenizer_dir: str):
         from transformers import AutoConfig
 
+        if not os.path.isdir(model_dir) or not os.path.exists(
+                os.path.join(model_dir, "config.json")):
+            raise FileNotFoundError(
+                f"'{model_dir}' is not a local HF checkpoint directory (config.json "
+                f"missing). Download it first, e.g.\n"
+                f"  from huggingface_hub import snapshot_download\n"
+                f"  snapshot_download('Qwen/Qwen2.5-32B-Instruct-GPTQ-Int4',\n"
+                f"      local_dir='{model_dir}',\n"
+                f"      allow_patterns=['*.json', '*.safetensors', '*.safetensors.index.json'])\n"
+                f"Tip: /kaggle/working is wiped when a session is recreated — upload the "
+                f"checkpoint as a Kaggle Dataset to avoid re-downloading.")
+
         hf_cfg = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
         qcfg = getattr(hf_cfg, "quantization_config", {}) or {}
         gs = int(qcfg.get("group_size", self.cfg.group_size))
@@ -1241,7 +1253,7 @@ def train_calibration(engine: "Tessera50BEngine", token_iter, steps: int = 500,
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
-        losses.append(float(ce))
+        losses.append(float(ce.detach()))
         if (step + 1) % report_every == 0:
             recent = losses[-report_every:]
             rate = report_every * len(x) / max(1e-9, time.time() - t0)
