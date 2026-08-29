@@ -193,8 +193,11 @@ def gptq_gemv_triton(x: torch.Tensor, qw8: torch.Tensor, sc: torch.Tensor,
     # 128x128 spills to local memory and slows every launch by orders of magnitude.
     BLOCK_N, BLOCK_K = 64, 64
     grid = (triton.cdiv(N, BLOCK_N),)
-    _gptq_gemv_kernel[grid](x, qw8, sc, qz8, g_idx, y, K, N,
-                            BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=4)
+    # Triton launches on the CURRENT cuda device; tensors on cuda:1 are unreachable
+    # from a cuda:0 launch context ("Pointer argument cannot be accessed").
+    with torch.cuda.device(x.device):
+        _gptq_gemv_kernel[grid](x, qw8, sc, qz8, g_idx, y, K, N,
+                                BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=4)
     return y
 
 
