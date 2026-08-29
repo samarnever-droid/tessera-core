@@ -492,6 +492,9 @@ class TesseraLayer:
         keys, vals = mrm.slots()
         if keys is None:
             return torch.zeros(cfg.d_model, dtype=q.dtype, device=q.device)
+        # MRM lives on dev0; layers on dev1 must pull the slots across PCIe
+        if keys.device != self.device:
+            keys, vals = keys.to(self.device, non_blocking=True), vals.to(self.device, non_blocking=True)
 
         S = keys.shape[0]
         kh = keys.float().view(S, cfg.n_heads, cfg.d_head)
