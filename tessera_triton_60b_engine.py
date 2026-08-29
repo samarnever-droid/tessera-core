@@ -268,7 +268,9 @@ def triton_adaptive_rope_qknorm(x: torch.Tensor, eta: torch.Tensor) -> torch.Ten
 def _diff_attn_vres_triton_kernel(
     Q1_ptr, K1_ptr, Q2_ptr, K2_ptr, V_ptr, V0_ptr, Out_ptr,
     B, H_pairs, T, Dk, Dv,
-    lambda_val,
+    Lambda_ab_ptr,   # [H_pairs, 2] raw a_p/b_p logits, one (a_p, b_p) pair per head-pair p
+    lambda_init,     # depth-dependent, non-trainable scalar (see host-side lambda_init(l))
+    vres_w,          # precomputed sigmoid(vres_gate) learned Value-Residual mixing weight
     has_v0: tl.constexpr,
     scale: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -280,6 +282,13 @@ def _diff_attn_vres_triton_kernel(
     offs_d = tl.arange(0, BLOCK_D)
     d_mask = offs_d < Dk
     v_mask = offs_d < Dv
+
+    # Unified per-pair DiffAttn lambda (matches crates/tessera-core/src/tessera_model.rs and
+    # tessera_triton.py's DifferentialAttention.lambda_eff exactly):
+    #   lambda_eff_p = max(0, exp(a_p) - exp(b_p) + lambda_init)
+    a_p = tl.load(Lambda_ab_ptr + p_idx * 2 + 0).to(tl.float32)
+    b_p = tl.load(Lambda_ab_ptr + p_idx * 2 + 1).to(tl.float32)
+    lambda_val = tl.maximum(tl.exp(a_p) - tl.exp(b_p) + lambda_init, 0.0)
 
     q1_offset = (b_idx * H_pairs + p_idx) * T * Dk + t_q_idx * Dk + offs_d
     q1 = tl.load(Q1_ptr + q1_offset, mask=d_mask, other=0.0).to(tl.float32)
@@ -325,10 +334,12 @@ def _diff_attn_vres_triton_kernel(
         v_offset = (b_idx * H_pairs + p_idx) * T * Dv + t_k * Dv + offs_d
         v_curr = tl.load(V_ptr + v_offset, mask=v_mask, other=0.0).to(tl.float32)
 
-        # Value Residual: V_s = 0.7 * V_s + 0.3 * V_0
+        # Learned Value Residual (ResFormer, arXiv:2410.17897): V_mixed = w * V_curr +
+        # (1 - w) * V_0, w = sigmoid(vres_gate) precomputed host-side into `vres_w`.
+        # Replaces the previously hardcoded 0.7 * V_s + 0.3 * V_0 constants.
         if has_v0:
             v0_val = tl.load(V0_ptr + v_offset, mask=v_mask, other=0.0).to(tl.float32)
-            v_eff = 0.7 * v_curr + 0.3 * v0_val
+            v_eff = vres_w * v_curr + (1.0 - vres_w) * v0_val
         else:
             v_eff = v_curr
 
@@ -477,14 +488,32 @@ class PureTesseraStageTriton:
         gamma_norm1: torch.Tensor,
         gamma_norm2: torch.Tensor,
         w_conv: torch.Tensor,
-        lambda_diff: float,
         eta_rope: torch.Tensor,
+        layer_idx: int = 0,
+        lambda_ab: Optional[torch.Tensor] = None,  # [n_pairs, 2] raw a_p/b_p logits
+        vres_gate: Optional[float] = None,          # PRE-sigmoid raw scalar
     ):
+        """
+        FIX: `lambda_diff: float` (a single hardcoded scalar applied identically at every
+        depth, e.g. `lambda_diff=0.80` in verify_pure_tessera_triton() below) has been
+        replaced with the unified, depth-dependent DiffAttn formula used everywhere else in
+        this codebase (crates/tessera-core/src/tessera_model.rs, tessera_triton.py,
+        tessera_pytorch.py):
+            lambda_eff_p = max(0, exp(a_p) - exp(b_p) + lambda_init(layer_idx))
+            lambda_init(l) = 0.8 - 0.6 * exp(-0.3 * (l - 1)),  l = layer_idx + 1
+        `lambda_ab` holds the per-pair trainable (a_p, b_p) logits (defaults to all-zero,
+        i.e. lambda_eff_p == lambda_init(layer_idx) exactly, matching this codebase's
+        zero-init convention elsewhere). `vres_gate` is the learned Value-Residual PRE-
+        sigmoid scalar (defaults to ln(0.7/0.3) ~= 0.8473, i.e. sigmoid(vres_gate) ~= 0.7,
+        matching the old hardcoded 0.7/0.3 constants as the learned starting point) --
+        replacing the previously hardcoded `v_eff = 0.7*v_curr + 0.3*v0_val` in the kernel.
+        """
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
         self.d_ff = d_ff
         self.r_adapter = r_adapter
+        self.layer_idx = layer_idx
 
         self.wq = wq
         self.wk = wk
@@ -500,8 +529,19 @@ class PureTesseraStageTriton:
         self.gamma_norm1 = gamma_norm1
         self.gamma_norm2 = gamma_norm2
         self.w_conv = w_conv
-        self.lambda_diff = lambda_diff
         self.eta_rope = eta_rope
+
+        n_pairs = n_heads // 2
+        l = float(layer_idx + 1)
+        self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * (l - 1.0))
+        device = w_conv.device
+        self.lambda_ab = (
+            lambda_ab.to(device=device, dtype=torch.float32)
+            if lambda_ab is not None
+            else torch.zeros((n_pairs, 2), dtype=torch.float32, device=device)
+        )
+        vres_raw = vres_gate if vres_gate is not None else 0.8473
+        self.vres_w = float(1.0 / (1.0 + math.exp(-vres_raw)))  # precomputed sigmoid(vres_gate)
 
     def forward(self, h: torch.Tensor, v0: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         B, T, D = h.shape
@@ -539,7 +579,9 @@ class PureTesseraStageTriton:
         _diff_attn_vres_triton_kernel[(B, n_pairs, T)](
             q1, k1, q2, k2, v_pairs, v0 if v0 is not None else v_pairs, attn_out_heads,
             B, n_pairs, T, d_k, d_k * 2,
-            self.lambda_diff,
+            self.lambda_ab,
+            self.lambda_init,
+            self.vres_w,
             has_v0=(v0 is not None),
             scale=1.0 / math.sqrt(d_k),
             BLOCK_D=BLOCK_D
@@ -611,8 +653,8 @@ def verify_pure_tessera_triton():
         gamma_norm1=torch.ones(d_model, dtype=torch.float16, device="cuda:0"),
         gamma_norm2=torch.ones(d_model, dtype=torch.float16, device="cuda:0"),
         w_conv=torch.randn((4, d_model), dtype=torch.float16, device="cuda:0") * 0.02,
-        lambda_diff=0.80,
-        eta_rope=torch.zeros(d_model // n_heads // 2, dtype=torch.float32, device="cuda:0")
+        eta_rope=torch.zeros(d_model // n_heads // 2, dtype=torch.float32, device="cuda:0"),
+        layer_idx=0,  # unified depth-dependent lambda_init is now derived from this
     )
 
     x = torch.randn((1, seq_len, d_model), dtype=torch.float16, device="cuda:0")
