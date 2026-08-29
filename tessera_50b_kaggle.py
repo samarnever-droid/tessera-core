@@ -74,6 +74,19 @@ except Exception:
     HAS_TRITON = False
 
 
+def free_memory() -> None:
+    """Best-effort release of GPU memory held by dead objects in this session,
+    then report per-GPU free/total. Stale engines from earlier cells keep their
+    weights alive until every reference is dropped (or the session restarts)."""
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        for i in range(torch.cuda.device_count()):
+            free, total = torch.cuda.mem_get_info(i)
+            print(f"  cuda:{i}: {free/1e9:.1f} GB free / {total/1e9:.1f} GB total")
+
+
 def triton_enabled(device: torch.device) -> bool:
     # Escape hatch: TESSERA_FORCE_TORCH=1 skips the Triton path entirely
     # (useful if Triton JIT compile thrashes on a given driver/GPU combo).
@@ -791,6 +804,10 @@ class Tessera50BEngine:
         self.cfg = cfg
         if torch.cuda.is_available():
             self.dev0, self.dev1 = torch.device("cuda:0"), torch.device("cuda:1")
+            for i in range(torch.cuda.device_count()):
+                free, total = torch.cuda.mem_get_info(i)
+                print(f"[tessera] cuda:{i}: {free/1e9:.1f} GB free / {total/1e9:.1f} GB "
+                      f"(if this is low, del stale engines or restart the session)")
         else:
             print("[!] CUDA not available -> single-device (CPU) smoke mode.")
             self.dev0 = self.dev1 = torch.device("cpu")
