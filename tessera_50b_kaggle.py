@@ -322,11 +322,19 @@ class GPTQLinear:
 
 
 def repack_nibbles(w4: torch.Tensor) -> torch.Tensor:
-    """[K, N] int (0..15) -> [K/8, N] int32, low nibble first."""
+    """[K, N] int (0..15) -> [K/8, N] int32, low nibble first (weights: 8 k-rows/word)."""
     k, n = w4.shape
     w4 = w4.reshape(k // 8, 8, n).to(torch.int32)
     shifts = (torch.arange(8, device=w4.device, dtype=torch.int32) * 4).view(1, 8, 1)
     return ((w4 << shifts).sum(dim=1)).to(torch.int32)
+
+
+def repack_zeros(z4: torch.Tensor) -> torch.Tensor:
+    """[G, N] int (0..15) -> [G, N/8] int32 (qzeros: 8 nibbles per word along N)."""
+    g, n = z4.shape
+    z4 = z4.reshape(g, n // 8, 8).to(torch.int32)
+    shifts = (torch.arange(8, device=z4.device, dtype=torch.int32) * 4).view(1, 1, 8)
+    return ((z4 << shifts).sum(dim=-1)).to(torch.int32)
 
 
 def ungqa(qw: torch.Tensor, sc: torch.Tensor, qz: torch.Tensor,
@@ -340,9 +348,9 @@ def ungqa(qw: torch.Tensor, sc: torch.Tensor, qz: torch.Tensor,
     w4 = unpack_nibbles(qw)                       # [K, N]
     w4 = w4.repeat_interleave(group, dim=1)       # [K, N*group]
     sc = sc.repeat_interleave(group, dim=1)       # [G, N*group]
-    z4 = unpack_zeros(qz)                          # [G, N]
+    z4 = unpack_zeros(qz)                         # [G, N]
     z4 = z4.repeat_interleave(group, dim=1)       # [G, N*group]
-    return repack_nibbles(w4), sc.contiguous(), repack_nibbles(z4)
+    return repack_nibbles(w4), sc.contiguous(), repack_zeros(z4)
 
 
 # ====================================================================================================
