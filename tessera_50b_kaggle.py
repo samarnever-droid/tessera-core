@@ -814,7 +814,61 @@ def sample_logits(logits: torch.Tensor, temperature: float, top_k: int,
 
 
 # ====================================================================================================
-# 7. SMOKE TEST (CPU, tiny random config — exercises every pillar end to end)
+# 7b. GPU SELF-CHECK: pinpoints where the CUDA path first goes non-finite
+# ====================================================================================================
+
+def check_gpu():
+    """Bisects the GPU forward pass: validates every Triton GEMV against a float64
+    torch reference, then walks a token layer-by-layer reporting finiteness."""
+    print("=" * 90)
+    print("  TESSERA-Q GPU SELF-CHECK (Triton GEMV vs float64 reference + layer bisect)")
+    print("=" * 90)
+    cfg = TesseraConfig(vocab_size=64, d_model=64, n_layers=4, n_heads=4,
+                        d_ff=192, r_adapter=8, group_size=16)
+    eng = Tessera50BEngine(cfg)
+    if eng.dev0.type != "cuda":
+        print("[!] No CUDA — nothing to check (CPU path already covered by --smoke).")
+        return
+
+    for li, layer in enumerate(eng.layers):
+        for name in ("w_gate", "wq", "wk", "wv", "wo", "w1", "w1u", "w2", "av", "au"):
+            W = getattr(layer, name)
+            K = W.qw.shape[0] * 8
+            x = (torch.randn(K, device=W.device, dtype=torch.float16) * 0.5)
+            if W.use_triton:
+                y_tri = gptq_gemv_triton(x, W.qw, W.sc, W.qz, W.g_idx).float()
+            else:
+                y_tri = W(x).float()
+            w_ref = dequant_gptq(W.qw.cpu(), W.sc.cpu(), W.qz.cpu(), W.g_idx.cpu().long()) \
+                .to(W.device).float()
+            y_ref = w_ref.t() @ x.float()
+            diff = (y_tri - y_ref).abs().max().item()
+            finite = torch.isfinite(y_tri).all().item()
+            flag = "OK " if (finite and diff < 1e-1) else "BAD"
+            print(f"  [{flag}] layer {li} {name:6s} finite={finite} max|tri-ref|={diff:.4f}")
+            if not finite:
+                print(f"      -> Triton output non-finite! ref absmax={y_ref.abs().max().item():.4f}")
+                return
+
+    # layer-by-layer token walk
+    eng.reset()
+    h = eng.embed[1]
+    print(f"\n  token walk: embed absmax={h.float().abs().max().item():.4f}")
+    for i, layer in enumerate(eng.layers):
+        h, _ = layer.forward(h, eng.mrm, 0, None)
+        amax = h.float().abs().max().item()
+        print(f"  after layer {i}: finite={torch.isfinite(h.float()).all().item()} absmax={amax:.4f}")
+        if not torch.isfinite(h.float()).all():
+            print(f"      -> layer {i} poisoned the hidden state; rerun with CUDA_LAUNCH_BLOCKING=1")
+            return
+    print("\n✓ all GEMVs match float64 reference; full forward is finite")
+    print("=" * 90)
+
+
+
+
+# ====================================================================================================
+# 8. SMOKE TEST (CPU, tiny random config — exercises every pillar end to end)
 # ====================================================================================================
 
 def smoke_test():
@@ -832,10 +886,10 @@ def smoke_test():
     for t in range(8):
         t0 = time.time()
         logits = eng.step(ids[-1])
+        assert torch.isfinite(logits).all(), f"non-finite logits at step {t}"
         probs = sample_logits(logits, 1.0, 0, 1.0)
         ids.append(int(torch.multinomial(probs, 1)))
         eng.pos += 1
-        assert torch.isfinite(logits).all(), f"non-finite logits at step {t}"
         print(f"  smoke step {t+1}/8 done in {time.time()-t0:.2f}s")
     assert all(isinstance(i, int) and 0 <= i < cfg.vocab_size for i in ids), ids
     assert eng.mrm.fine_n > 0, "MRM should have received writes"
@@ -859,10 +913,16 @@ if __name__ == "__main__":
     ap.add_argument("--top-k", type=int, default=50)
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--smoke", action="store_true", help="tiny CPU self-test")
+    ap.add_argument("--check-gpu", action="store_true",
+                    help="validate Triton GEMVs vs float64 reference on CUDA")
     args = ap.parse_args()
 
     if args.smoke:
         smoke_test()
+        sys.exit(0)
+
+    if args.check_gpu:
+        check_gpu()
         sys.exit(0)
 
     eng = Tessera50BEngine(model_dir=args.model, tokenizer_dir=args.tokenizer)
