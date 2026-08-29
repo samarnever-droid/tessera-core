@@ -240,7 +240,7 @@ class GPTQLinear:
             return gptq_gemv_triton(x.to(self.device), self.qw, self.sc, self.qz, self.g_idx)
         # Fallback: dequantize chunk-by-chunk and matvec (exact, slow).
         N = self.sc.shape[1]
-        y = torch.empty(N, dtype=torch.float32, device=self.device)
+        y = torch.zeros(N, dtype=torch.float32, device=self.device)  # MUST be zeros: += accumulates
         K = self.qw.shape[0] * 8
         for k0 in range(0, K, 512):
             k1 = min(k0 + 512, K)
