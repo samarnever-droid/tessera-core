@@ -829,6 +829,11 @@ def check_gpu():
     if eng.dev0.type != "cuda":
         print("[!] No CUDA — nothing to check (CPU path already covered by --smoke).")
         return
+    if not triton_enabled(eng.dev0):
+        print("[!] WARNING: Triton path is NOT active (fallback in use). This check only\n"
+              "    exercises the PyTorch fallback. To test Triton: unset TESSERA_FORCE_TORCH\n"
+              "    in THIS process and re-run, e.g.  os.environ.pop('TESSERA_FORCE_TORCH', None)\n"
+              "    then call check_gpu() directly instead of via a !shell subprocess.")
 
     for li, layer in enumerate(eng.layers):
         for name in ("w_gate", "wq", "wk", "wv", "wo", "w1", "w1u", "w2", "av", "au"):
